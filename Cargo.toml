@@ -1,0 +1,21 @@
+[package]
+name = "labyrinth-pinocchio"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+bpf-entrypoint = []
+
+[dependencies]
+ephemeral-rollups-pinocchio = "=0.16.2"
+pinocchio = { version = "0.10.2", features = ["cpi"] }
+pinocchio-system = { version = "0.5.0", default-features = false }
+solana-sha256-hasher = { version = "3.1.0", features = ["sha2"] }
+
+[dev-dependencies]
+solana-address = { version = "2.5.0", features = ["curve25519"] }
