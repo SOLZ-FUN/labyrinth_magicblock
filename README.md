@@ -9,11 +9,12 @@ Configured program: [FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH](https://explo
 
 ## v5 player-paid bootstrap
 
-The selected player Session Key creates Labyrinth accounts, pays their rent and
+The selected final player creates Labyrinth accounts, pays their rent and
 delegation fees, delegates Event Chunks first, and delegates Match last. The
-Main Wallet can top up the Session Key before bootstrap, but is never a
-Labyrinth authority. Colyseus signs an immutable permit and observes readiness;
-it does not submit or pay initialization/delegation transactions.
+permit allows either that player's existing Session Key or its corresponding
+Main Wallet to pay and sign the bootstrap. Colyseus signs an immutable permit
+and observes readiness; it does not submit or pay initialization/delegation
+transactions.
 
 See [Player-paid ER bootstrap](docs/PLAYER_PAID_ER_BOOTSTRAP.md) for the full
 protocol, recovery path, cost estimate, and diagrams.
@@ -22,7 +23,9 @@ protocol, recovery path, cost estimate, and diagrams.
 
 Earlier v4 integrations used the backend signer as payer/submitter. That flow
 is preserved as historical context only; new integration uses v5 player-paid
-bootstrap. This repository does not claim deployment.
+bootstrap. The v5 binary is deployed on Devnet at the configured program ID.
+Existing v4 Match accounts remain runtime-readable; all new player-paid worlds
+use v5.
 
 ## Checks
 

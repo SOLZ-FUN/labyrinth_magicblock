@@ -33,9 +33,11 @@ pub const MAX_EVENT_PAYLOAD: usize = 64;
 pub const MATCH_KIND_RANKED: u8 = 0;
 pub const MATCH_KIND_DIRECT: u8 = 1;
 pub const LAUNCH_PERMIT_VERSION_V2: u8 = 2;
-/// The selected player pays only through its existing Session-Key Wallet. A
-/// Main Wallet may top it up beforehand, but never becomes Labyrinth authority.
+/// Legacy tag-2 permit policy retained solely for decoding v4 transactions.
 pub const PAYER_POLICY_SESSION_KEY: u8 = 1;
+/// A v5 bootstrap may be paid by the designated initializer's Main Wallet or
+/// the corresponding existing Session-Key Wallet.
+pub const PAYER_POLICY_MAIN_OR_SESSION: u8 = 1;
 
 pub const DELEGATE_TARGET_MATCH: u8 = 0;
 pub const DELEGATE_TARGET_EVENT_CHUNK: u8 = 1;
@@ -76,8 +78,8 @@ pub struct InitializeMatchV5Args<'a> {
     pub initializer_index: u8,
     pub payer_policy: u8,
     pub permit_revision: u32,
-    pub takeover_slot: u64,
-    pub expires_slot: u64,
+    /// Unsigned Unix timestamp (seconds), checked against Clock::unix_timestamp.
+    pub expires_at: u64,
     pub roster_metadata: &'a [u8],
     /// Exact bytes signed through the preceding Ed25519 precompile.
     pub permit_payload: &'a [u8],
@@ -290,7 +292,7 @@ pub fn parse_delegate_target(data: &[u8]) -> Result<DelegateTargetArgs, ProgramE
 /// Parses the exact payload after instruction tag 16. The detached Ed25519
 /// signature is intentionally not duplicated in this instruction.
 pub fn parse_initialize_match_v5(data: &[u8]) -> Result<InitializeMatchV5Args<'_>, ProgramError> {
-    const FIXED_LEN: usize = 225;
+    const FIXED_LEN: usize = 217;
     if data.len() < FIXED_LEN {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -322,13 +324,11 @@ pub fn parse_initialize_match_v5(data: &[u8]) -> Result<InitializeMatchV5Args<'_
     let initializer_index = read_u8(data, &mut offset)?;
     let payer_policy = read_u8(data, &mut offset)?;
     let permit_revision = read_u32(data, &mut offset)?;
-    let takeover_slot = read_u64(data, &mut offset)?;
-    let expires_slot = read_u64(data, &mut offset)?;
+    let expires_at = read_u64(data, &mut offset)?;
     if offset != FIXED_LEN
         || !matches!(match_kind, MATCH_KIND_RANKED | MATCH_KIND_DIRECT)
-        || payer_policy != PAYER_POLICY_SESSION_KEY
-        || takeover_slot == 0
-        || expires_slot <= takeover_slot
+        || payer_policy != PAYER_POLICY_MAIN_OR_SESSION
+        || expires_at == 0
         || player_count == 0
         || usize::from(player_count) > MAX_PLAYERS
         || usize::from(initializer_index) >= usize::from(player_count)
@@ -372,8 +372,7 @@ pub fn parse_initialize_match_v5(data: &[u8]) -> Result<InitializeMatchV5Args<'_
         initializer_index,
         payer_policy,
         permit_revision,
-        takeover_slot,
-        expires_slot,
+        expires_at,
         roster_metadata: &data[offset..],
         permit_payload,
     })
@@ -699,7 +698,7 @@ mod tests {
 
     #[test]
     fn v5_max_roster_and_rule_counts_parse_with_bounded_wires() {
-        let mut init = [0u8; 225 + MAX_PLAYERS * INITIALIZE_ROSTER_ENTRY_LEN];
+        let mut init = [0u8; 217 + MAX_PLAYERS * INITIALIZE_ROSTER_ENTRY_LEN];
         init[16] = MATCH_KIND_RANKED;
         init[17] = 1; // non-zero ranked MatchRecord
         init[49] = 2; // validator
@@ -716,15 +715,14 @@ mod tests {
         init[201] = MAX_GENERATION_RULES as u8;
         init[202] = 8;
         init[203] = (MAX_PLAYERS - 1) as u8;
-        init[204] = PAYER_POLICY_SESSION_KEY;
+        init[204] = PAYER_POLICY_MAIN_OR_SESSION;
         init[205..209].copy_from_slice(&7u32.to_le_bytes());
-        init[209..217].copy_from_slice(&1_000u64.to_le_bytes());
-        init[217..225].copy_from_slice(&1_900_000_000u64.to_le_bytes());
+        init[209..217].copy_from_slice(&1_900_000_000u64.to_le_bytes());
         let parsed = parse_initialize_match_v5(&init).unwrap();
         assert_eq!(parsed.player_count, 12);
         assert_eq!(parsed.rule_count, 16);
         assert_eq!(parsed.roster_metadata.len(), 48);
-        assert_eq!(init.len(), 273);
+        assert_eq!(init.len(), 265);
 
         let mut chunk = [0u8; 19 + MAX_GENERATION_RULES * GENERATION_RULE_LEN];
         chunk[18] = MAX_GENERATION_RULES as u8;
@@ -740,7 +738,7 @@ mod tests {
 
     #[test]
     fn v5_parser_rejects_payer_policy_and_length_tampering() {
-        let mut init = [0u8; 225 + INITIALIZE_ROSTER_ENTRY_LEN];
+        let mut init = [0u8; 217 + INITIALIZE_ROSTER_ENTRY_LEN];
         init[16] = MATCH_KIND_DIRECT;
         init[177..179].copy_from_slice(&1u16.to_le_bytes());
         init[179..181].copy_from_slice(&1u16.to_le_bytes());
@@ -752,13 +750,12 @@ mod tests {
         init[199..201].copy_from_slice(&1u16.to_le_bytes());
         init[201] = 1;
         init[202] = 1;
-        init[204] = PAYER_POLICY_SESSION_KEY;
-        init[209..217].copy_from_slice(&1_000u64.to_le_bytes());
-        init[217..225].copy_from_slice(&1_900_000_000u64.to_le_bytes());
+        init[204] = PAYER_POLICY_MAIN_OR_SESSION;
+        init[209..217].copy_from_slice(&1_900_000_000u64.to_le_bytes());
         assert!(parse_initialize_match_v5(&init).is_ok());
         init[204] = 9;
         assert!(parse_initialize_match_v5(&init).is_err());
-        init[204] = PAYER_POLICY_SESSION_KEY;
+        init[204] = PAYER_POLICY_MAIN_OR_SESSION;
         let original_validator = {
             let parsed = parse_initialize_match_v5(&init).unwrap();
             assert_ne!(parsed.permit_payload, &[]);

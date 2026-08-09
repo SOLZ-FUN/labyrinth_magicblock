@@ -504,8 +504,10 @@ fn process_initialize_match_v5(
         return Err(LabyrinthError::InvalidConfig.into());
     }
     let config = load_config(program_id, config_account)?;
-    let current_slot = pinocchio::sysvars::clock::Clock::get()?.slot;
-    if args.expires_slot <= current_slot {
+    let clock = pinocchio::sysvars::clock::Clock::get()?;
+    let current_unix_timestamp =
+        u64::try_from(clock.unix_timestamp).map_err(|_| ProgramError::InvalidInstructionData)?;
+    if args.expires_at <= current_unix_timestamp {
         return Err(ProgramError::InvalidInstructionData);
     }
     let permit_message = launch_permit_message(program_id, args.permit_payload);
@@ -529,12 +531,9 @@ fn process_initialize_match_v5(
     }
     let initializer = usize::from(args.initializer_index) * crate::instruction::ROSTER_ENTRY_LEN;
     let payer_bytes = payer.address().as_array();
-    if &canonical_roster[initializer + 32..initializer + 64] != payer_bytes
-        && (current_slot < args.takeover_slot
-            || !canonical_roster
-                .chunks_exact(crate::instruction::ROSTER_ENTRY_LEN)
-                .any(|entry| &entry[32..64] == payer_bytes))
-    {
+    let initializer_main = &canonical_roster[initializer..initializer + 32];
+    let initializer_session = &canonical_roster[initializer + 32..initializer + 64];
+    if initializer_main != payer_bytes && initializer_session != payer_bytes {
         return Err(LabyrinthError::UnauthorizedSession.into());
     }
     if let Some(ranked_record) = ranked_record {
@@ -630,7 +629,7 @@ fn process_initialize_and_delegate_event_chunk_v5(
         if state.version() != PROGRAM_VERSION || state.match_id() != args.match_id {
             return Err(ProgramError::InvalidAccountData);
         }
-        state.find_session(payer.address().as_array())?;
+        state.find_authority(payer.address().as_array())?;
         if state.er_validator() != *validator.address().as_array() {
             return Err(ProgramError::IncorrectAuthority);
         }
@@ -733,7 +732,7 @@ fn process_delegate_match_v5(
         if state.version() != PROGRAM_VERSION || state.match_id() != match_id {
             return Err(ProgramError::InvalidAccountData);
         }
-        state.find_session(payer.address().as_array())?;
+        state.find_authority(payer.address().as_array())?;
         if state.er_validator() != *validator.address().as_array() {
             return Err(ProgramError::IncorrectAuthority);
         }

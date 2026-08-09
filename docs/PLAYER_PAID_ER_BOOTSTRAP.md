@@ -6,11 +6,13 @@ Labyrinth v5 is a player-paid bootstrap protocol. The canonical Ranked
 Matchmaking match ID is also the Labyrinth match ID. The configured program is
 [FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH](https://explorer.solana.com/address/FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH?cluster=devnet).
 
-The selected finalizer's existing **Session Key** signs and pays Match-account
-rent, Event Chunk rent, and delegation fees. The Main Wallet can fund a
-Session-Key shortfall beforehand, but it never signs as a Labyrinth payer or
-authority. MagicBlock ER executes delegated state; it is not a separate player
-wallet.
+The selected finalizer's existing **Session Key** normally signs and pays
+Match-account rent, Event Chunk rent, and delegation fees. If it does not
+cover the complete preflight, the corresponding **Main Wallet** can be
+explicitly selected as payer and signer for the same bootstrap. Both paths are
+limited to the designated initializer during creation; neither gives Labyrinth
+authority over Ranked stake or payout. MagicBlock ER executes delegated state;
+it is not a separate player wallet.
 
 Colyseus freezes roster/configuration, signs an immutable launch permit, and
 observes the ER world. It remains authoritative for movement, combat, portal
@@ -19,8 +21,8 @@ occupancy, and winner selection. It never submits or pays
 
 The preceding Ed25519 permit binds program ID, canonical match ID, Ranked
 MatchRecord (or zero for Direct), locked roster/Session Authorities, immutable
-configuration and rules hashes, ER validator, finalizer index, Session-Key
-payer policy, takeover slot, and expiry slot. Altering a signed input
+configuration and rules hashes, ER validator, finalizer index, Main-or-Session
+payer policy, permit revision, and Unix expiry time. Altering a signed input
 invalidates the permit.
 
 ## Ranked: two confirmed stages
@@ -32,7 +34,7 @@ can resume safely.
 ```mermaid
 sequenceDiagram
     participant Q as Ranked queue
-    participant F as Final player Session Key
+    participant F as Final player payer
     participant M as Ranked Matchmaking
     participant W as Main Wallet when needed
     participant L as Labyrinth program
@@ -41,8 +43,8 @@ sequenceDiagram
     Q->>F: Lock roster and signed permit
     F->>M: create_authorized_match, confirmed
     F->>F: Rent and fee preflight
-    alt Session Key shortfall
-        W->>F: Top up Session Key
+    alt Session Key does not cover the complete estimate
+        W->>L: Main Wallet explicitly signs and pays the same bootstrap
     end
     F->>L: Initialize v5 Match
     loop Event Chunks 0 to N-1
@@ -66,7 +68,7 @@ bootstrap after finalizer selection.
 ```mermaid
 sequenceDiagram
     participant C as Colyseus
-    participant F as Selected Session Key
+    participant F as Selected player payer
     participant L as Labyrinth program
     participant ER as MagicBlock ER
     C->>F: Frozen Direct roster/config and signed permit
@@ -79,15 +81,16 @@ sequenceDiagram
     C-->>F: Game transition allowed
 ```
 
-## Main-Wallet shortfall
+## Payer selection
 
 ```mermaid
 flowchart TD
-    A[Session-Key balance preflight] --> B{Enough rent plus fee buffer?}
-    B -- Yes --> C[Submit player-paid bootstrap]
-    B -- No --> D[Prompt Main Wallet top-up]
-    D --> E[Transfer only to Session Key]
-    E --> A
+    A[Session-Key complete-cost preflight] --> B{Enough rent plus fee buffer?}
+    B -- Yes --> C[Session Key signs and pays]
+    B -- No --> D[Prompt for Main Wallet approval]
+    D --> E[Main Wallet signs and pays]
+    C --> F[Same permit, Match ID, and roster]
+    E --> F
 ```
 
 ## Recovery and delegation order
@@ -99,30 +102,48 @@ of charging rent twice.
 
 ```mermaid
 sequenceDiagram
-    participant F as Selected finalizer Session Key
-    participant R as Locked-roster Session Key
+    participant F as Selected finalizer authority
+    participant R as Locked-roster Main Wallet or Session Key
     participant L as Labyrinth program
     participant ER as MagicBlock ER
     F->>L: Initialize and delegate chunks 0 through k
     F--xER: Disconnect
-    Note over R,L: Before takeover slot, only finalizer can bootstrap
-    Note over R,L: After takeover slot, roster Session Key may resume
-    R->>L: Verify identical signed permit and state
+    Note over R,L: Initial creation requires the designated finalizer
+    Note over R,L: After Match creation, any roster authority may resume
+    R->>L: Verify identical state and delegated chunks
     R->>L: Resume missing chunks
     R->>L: Delegate Match last
     L->>ER: Ready
 ```
 
 Takeover cannot change roster, configuration, validator, or canonical match
-ID. It only allows another locked-roster Session Key to finish the same work.
+ID. Before Match creation the server issues a new permit revision to the next
+finalizer. After creation, any locked-roster Main Wallet or Session Key may
+finish only the missing chunk/Match delegation operations.
 
 ## Rent estimate
 
-The current configuration has one 5,088-byte Match account and **8**
-preallocated 2,848-byte Event Chunk accounts. Base-account rent is
-approximately **0.20200704 SOL**, plus a transaction/delegation buffer. This
-is configuration-dependent, not a fixed ER fee. The Session Key pays it after
-client preflight; a lazy-chunk future design could change the estimate.
+The current default has one 5,088-byte Match account and **8** preallocated
+2,848-byte Event Chunk accounts. A chunk contains up to **32** compact,
+append-only events, so the default preserves **256** important events.
+
+These are not VRF batches and they do not store movement, HP ticks, bullets,
+or frame-level gameplay. They preserve room resolutions, kills, respawns,
+portal transitions, extraction, and final state so clients/indexers can replay
+verifiable match history after ER commits to base Solana.
+
+The chunks are preallocated because the current program validates a fixed,
+bounded chunk-account set for event writes. That gives deterministic account
+metas during gameplay and lets the delegated-chunk mask prove that the world
+is complete before Match delegation. Eight is the default capacity, not an
+inherent MagicBlock requirement: a shorter configured match may use fewer
+chunks, while the v5 mask supports up to 16. Reducing the count lowers upfront
+rent but also lowers the maximum durable event history.
+
+For eight chunks, Match + chunks base rent is approximately **0.20200704 SOL**.
+Delegation records/metadata and transaction fees bring the current preflight
+estimate to approximately **0.230153280 SOL** before the 0.001 SOL safety
+reserve. This is configuration-dependent, not a fixed ER fee.
 
 ## Explorer links
 
@@ -137,5 +158,5 @@ submitter. This historical flow is preserved for comparison and is not deleted
 or rewritten here. It is superseded for new launches because the server should
 not pay player world-account rent or submit bootstrap transactions.
 
-No deployment is claimed by this document. Deploy only after program tests,
-artifact verification, and a separate Devnet player-paid smoke test succeed.
+The v5 binary was deployed to Devnet in slot `482420384`. The Direct and
+Ranked player-paid smoke tests both succeeded before this document was updated.

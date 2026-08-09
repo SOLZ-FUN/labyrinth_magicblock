@@ -1596,14 +1596,14 @@ mod tests {
     }
 
     #[test]
-    fn player_paid_v5_uses_only_a_roster_session_key() {
+    fn player_paid_v5_accepts_roster_main_or_session_authority() {
         let mut data = initialize(2, 4);
         let state = MatchState::load(&mut data).unwrap();
-        // Player 0's Main Wallet is never a v5 rent/delegation authority.
-        assert!(state.find_session(&[1; 32]).is_err());
-        assert_eq!(state.find_session(&[31; 32]).unwrap(), 0);
-        assert_eq!(state.find_session(&[32; 32]).unwrap(), 1);
-        assert!(state.find_session(&[99; 32]).is_err());
+        assert_eq!(state.find_authority(&[1; 32]).unwrap(), 0);
+        assert_eq!(state.find_authority(&[31; 32]).unwrap(), 0);
+        assert_eq!(state.find_authority(&[2; 32]).unwrap(), 1);
+        assert_eq!(state.find_authority(&[32; 32]).unwrap(), 1);
+        assert!(state.find_authority(&[99; 32]).is_err());
     }
 
     #[test]
