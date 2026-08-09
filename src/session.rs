@@ -1,12 +1,21 @@
 use pinocchio::{error::ProgramError, AccountView, Address, ProgramResult};
+use solana_sha256_hasher::hashv;
 
-use crate::{error::LabyrinthError, instruction::ROSTER_ENTRY_LEN};
+use crate::{
+    error::LabyrinthError,
+    instruction::{INITIALIZE_ROSTER_ENTRY_LEN, ROSTER_ENTRY_LEN},
+};
 
 const SESSION_AUTHORITY_SEED: &[u8] = b"session_authority";
 const MATCH_RECORD_SEED: &[u8] = b"match_record";
 const SESSION_AUTHORITY_LEN: usize = 76;
 const MATCH_RECORD_ROSTER_OFFSET: usize = 260;
 const MATCH_RECORD_MIN_LEN: usize = MATCH_RECORD_ROSTER_OFFSET + 12 * 32;
+const ROSTER_HASH_DOMAIN: &[u8] = b"solz-labyrinth-roster-v1";
+
+pub fn canonical_roster_hash(canonical_roster: &[u8]) -> [u8; 32] {
+    hashv(&[ROSTER_HASH_DOMAIN, canonical_roster]).to_bytes()
+}
 
 pub fn validate_ranked_match_record(
     ranked_program: &Address,
@@ -46,38 +55,48 @@ pub fn validate_ranked_match_record(
     Ok(())
 }
 
-pub fn validate_ranked_sessions(
+pub fn canonicalize_ranked_sessions(
     ranked_program: &Address,
     session_accounts: &[AccountView],
-    roster: &[u8],
+    roster_metadata: &[u8],
+    canonical_roster: &mut [u8],
 ) -> ProgramResult {
-    if roster.len() != session_accounts.len() * ROSTER_ENTRY_LEN {
+    if roster_metadata.len() != session_accounts.len() * INITIALIZE_ROSTER_ENTRY_LEN
+        || canonical_roster.len() != session_accounts.len() * ROSTER_ENTRY_LEN
+    {
         return Err(LabyrinthError::InvalidRoster.into());
     }
     for (index, session_authority) in session_accounts.iter().enumerate() {
         let offset = index * ROSTER_ENTRY_LEN;
-        let main_wallet: &[u8; 32] = roster[offset..offset + 32]
-            .try_into()
-            .map_err(|_| ProgramError::InvalidInstructionData)?;
-        let session_wallet = &roster[offset + 32..offset + 64];
-        let (expected_pda, _) =
-            Address::derive_program_address(&[SESSION_AUTHORITY_SEED, main_wallet], ranked_program)
-                .ok_or(ProgramError::InvalidSeeds)?;
-        if session_authority.address() != &expected_pda
-            || !session_authority.owned_by(ranked_program)
+        if !session_authority.owned_by(ranked_program)
             || session_authority.data_len() < SESSION_AUTHORITY_LEN
         {
             return Err(LabyrinthError::UnauthorizedSession.into());
         }
         let data = session_authority.try_borrow()?;
+        let main_wallet: &[u8; 32] = data[2..34]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let session_wallet = &data[34..66];
+        let (expected_pda, _) =
+            Address::derive_program_address(&[SESSION_AUTHORITY_SEED, main_wallet], ranked_program)
+                .ok_or(ProgramError::InvalidSeeds)?;
+        if session_authority.address() != &expected_pda {
+            return Err(LabyrinthError::UnauthorizedSession.into());
+        }
         if data[0] != 1
-            || data[2..34] != *main_wallet
-            || data[34..66] != *session_wallet
             || data[66] != 0
             || data[67] != 1
+            || main_wallet.iter().all(|byte| *byte == 0)
+            || session_wallet.iter().all(|byte| *byte == 0)
         {
             return Err(LabyrinthError::UnauthorizedSession.into());
         }
+        canonical_roster[offset..offset + 32].copy_from_slice(main_wallet);
+        canonical_roster[offset + 32..offset + 64].copy_from_slice(session_wallet);
+        let metadata_offset = index * INITIALIZE_ROSTER_ENTRY_LEN;
+        canonical_roster[offset + 64..offset + 68]
+            .copy_from_slice(&roster_metadata[metadata_offset..metadata_offset + 4]);
     }
     Ok(())
 }

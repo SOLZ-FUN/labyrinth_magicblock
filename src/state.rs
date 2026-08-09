@@ -1,19 +1,25 @@
-use pinocchio::error::ProgramError;
+use pinocchio::{error::ProgramError, ProgramResult};
 use solana_sha256_hasher::hashv;
 
 use crate::{
     error::LabyrinthError,
     events::{EventBatch, MatchEvent, MAX_EVENTS_PER_BATCH},
-    instruction::{GenerationRule, InitializeMatchArgs, MAX_EVENT_PAYLOAD, ROSTER_ENTRY_LEN},
+    instruction::{
+        GenerationRule, InitializeMatchArgs, InitializeMatchV5Args, MATCH_KIND_DIRECT,
+        MATCH_KIND_RANKED, MAX_EVENT_PAYLOAD, ROSTER_ENTRY_LEN,
+    },
 };
 
-pub const PROGRAM_VERSION: u8 = 2;
+pub const LEGACY_PROGRAM_VERSION: u8 = 4;
+pub const PROGRAM_VERSION: u8 = 5;
+pub const BOOTSTRAP_SCHEMA_V2: u8 = 2;
+pub const BOOTSTRAP_FLAG_INITIALIZED: u8 = 1 << 0;
+pub const BOOTSTRAP_FLAG_ALL_CHUNKS_READY: u8 = 1 << 1;
 pub const MAX_PLAYERS: usize = 12;
 pub const MAX_ROOMS: usize = 64;
 pub const MAX_GENERATION_RULES: usize = 16;
-/// A complete `delegate_match` call carries the match plus every chunk's
-/// delegation accounts. Twelve keeps that one lifecycle transaction under
-/// Solana's practical account-list limit while retaining 384 durable events.
+/// Each event chunk is delegated independently, avoiding account-list limits
+/// while retaining 384 durable events across the configured chunk set.
 pub const MAX_EVENT_CHUNKS: usize = 12;
 pub const MAX_EVENTS_PER_CHUNK: usize = 32;
 
@@ -98,8 +104,17 @@ const H_PRIMARY_WINNER: usize = 320;
 const H_TERMINAL_RESULT_HASH: usize = 322;
 const H_WINNERS: usize = 354;
 const H_ER_VALIDATOR: usize = 378;
+const H_MATCH_KIND: usize = 410;
+// Reserved header bytes are now part of the player-paid bootstrap state. They
+// fit before the immutable rule table, so the deployed account size remains
+// stable across the v4 -> v5 authority change.
+const H_BOOTSTRAP_SCHEMA: usize = 411;
+const H_INITIALIZER_INDEX: usize = 412;
+const H_DELEGATED_CHUNK_MASK: usize = 413;
+const H_BOOTSTRAP_FLAGS: usize = 415;
 const H_RULES: usize = 416;
 const RULE_ROW_LEN: usize = 8;
+const RULES_HASH_DOMAIN: &[u8] = b"solz-labyrinth-rules-v1";
 
 const P_MAIN: usize = 0;
 const P_SESSION: usize = 32;
@@ -157,6 +172,9 @@ pub struct InitializeMatch<'a> {
     pub bump: u8,
     pub backend_authority: [u8; 32],
     pub ranked_program: [u8; 32],
+    pub er_validator: [u8; 32],
+    pub finalizer_index: u8,
+    pub bootstrap_permit_version: u8,
     pub args: InitializeMatchArgs<'a>,
 }
 
@@ -197,6 +215,7 @@ impl<'a> MatchState<'a> {
         data[H_RANKED_PROGRAM..H_RANKED_PROGRAM + 32].copy_from_slice(&input.ranked_program);
         data[H_RANKED_MATCH_RECORD..H_RANKED_MATCH_RECORD + 32]
             .copy_from_slice(&input.args.ranked_match_record);
+        data[H_MATCH_KIND] = input.args.match_kind;
         data[H_MATCH_ID..H_MATCH_ID + 16].copy_from_slice(&input.args.match_id);
         data[H_CONFIG_HASH..H_CONFIG_HASH + 32].copy_from_slice(&input.args.config_hash);
         data[H_GENERATION_PROFILE_HASH..H_GENERATION_PROFILE_HASH + 32]
@@ -227,6 +246,11 @@ impl<'a> MatchState<'a> {
         data[H_EVENT_CHUNK_COUNT] = input.args.event_chunk_count;
         data[H_MATCH_VRF_STATE] = VRF_UNINITIALIZED;
         data[H_PORTAL_STATE] = PORTAL_LOCKED;
+        data[H_ER_VALIDATOR..H_ER_VALIDATOR + 32].copy_from_slice(&input.er_validator);
+        data[H_BOOTSTRAP_SCHEMA] = input.bootstrap_permit_version;
+        data[H_INITIALIZER_INDEX] = input.finalizer_index;
+        write_u16(data, H_DELEGATED_CHUNK_MASK, 0)?;
+        data[H_BOOTSTRAP_FLAGS] = BOOTSTRAP_FLAG_INITIALIZED;
         write_u16(data, H_PORTAL_ROOM, u16::MAX)?;
         write_u16(data, H_PRIMARY_WINNER, u16::MAX)?;
         for (index, rule) in input.args.rules.iter().enumerate() {
@@ -260,6 +284,69 @@ impl<'a> MatchState<'a> {
         Ok(Self { data })
     }
 
+    /// Initializes only the canonical Match account. Generation rules are
+    /// intentionally installed by chunk zero so account rent/delegation can be
+    /// resumed one transaction at a time.
+    pub fn initialize_v5(
+        data: &'a mut [u8],
+        bump: u8,
+        backend_authority: [u8; 32],
+        ranked_program: [u8; 32],
+        args: InitializeMatchV5Args<'_>,
+        canonical_roster: &[u8],
+    ) -> Result<Self, ProgramError> {
+        let mut placeholder_rules = [GenerationRule::default(); MAX_GENERATION_RULES];
+        for (index, rule) in placeholder_rules
+            .iter_mut()
+            .take(usize::from(args.rule_count))
+            .enumerate()
+        {
+            rule.type_id = (index + 1) as u16;
+            rule.weight = 1;
+        }
+        let common = InitializeMatchArgs {
+            match_id: args.match_id,
+            match_kind: args.match_kind,
+            ranked_match_record: args.ranked_match_record,
+            config_hash: args.config_hash,
+            generation_profile_hash: args.generation_profile_hash,
+            config_version: args.config_version,
+            generation_version: args.generation_version,
+            room_generation_profile: args.room_generation_profile,
+            combat_mode: args.combat_mode,
+            party_mode: args.party_mode,
+            friendly_fire_rule: args.friendly_fire_rule,
+            respawn_enabled: args.respawn_enabled,
+            extraction_mode: args.extraction_mode,
+            event_schema_version: args.event_schema_version,
+            room_count: args.room_count,
+            player_count: args.player_count,
+            portal_unlock_kills: args.portal_unlock_kills,
+            portal_required_players: args.portal_required_players,
+            portal_type_id: args.portal_type_id,
+            rule_count: args.rule_count,
+            event_chunk_count: args.event_chunk_count,
+            rules: placeholder_rules,
+            roster: canonical_roster,
+        };
+        let state = Self::initialize(
+            data,
+            InitializeMatch {
+                bump,
+                backend_authority,
+                ranked_program,
+                er_validator: args.er_validator,
+                finalizer_index: args.initializer_index,
+                bootstrap_permit_version: BOOTSTRAP_SCHEMA_V2,
+                args: common,
+            },
+        )?;
+        // The placeholder only lets us share the strict immutable-config and
+        // roster initialization path. No placeholder rule leaves this ix.
+        state.data[H_RULES..H_RULES + MAX_GENERATION_RULES * RULE_ROW_LEN].fill(0);
+        Ok(state)
+    }
+
     pub fn load(data: &'a mut [u8]) -> Result<Self, ProgramError> {
         validate_match(data)?;
         Ok(Self { data })
@@ -287,6 +374,10 @@ impl<'a> MatchState<'a> {
         self.data[H_PHASE]
     }
 
+    pub fn version(&self) -> u8 {
+        self.data[H_VERSION]
+    }
+
     pub fn bump(&self) -> u8 {
         self.data[H_BUMP]
     }
@@ -295,6 +386,10 @@ impl<'a> MatchState<'a> {
         self.data[H_MATCH_ID..H_MATCH_ID + 16]
             .try_into()
             .expect("fixed match id range")
+    }
+
+    pub fn match_kind(&self) -> u8 {
+        self.data[H_MATCH_KIND]
     }
 
     pub fn backend_authority(&self) -> [u8; 32] {
@@ -315,8 +410,181 @@ impl<'a> MatchState<'a> {
         usize::from(self.data[H_EVENT_CHUNK_COUNT])
     }
 
-    pub fn set_er_validator(&mut self, validator: [u8; 32]) {
-        self.data[H_ER_VALIDATOR..H_ER_VALIDATOR + 32].copy_from_slice(&validator);
+    pub fn er_validator(&self) -> [u8; 32] {
+        self.data[H_ER_VALIDATOR..H_ER_VALIDATOR + 32]
+            .try_into()
+            .expect("fixed ER validator range")
+    }
+
+    pub fn finalizer_index(&self) -> u8 {
+        self.data[H_INITIALIZER_INDEX]
+    }
+
+    pub fn bootstrap_permit_version(&self) -> u8 {
+        self.data[H_BOOTSTRAP_SCHEMA]
+    }
+
+    pub fn delegated_chunk_mask(&self) -> u16 {
+        read_u16(self.data, H_DELEGATED_CHUNK_MASK).unwrap_or_default()
+    }
+
+    pub fn is_finalizer_authority(&self, authority: &[u8; 32]) -> Result<bool, ProgramError> {
+        let index = usize::from(self.finalizer_index());
+        if index >= usize::from(self.player_count()) {
+            return Err(LabyrinthError::InvalidConfig.into());
+        }
+        let offset = player_offset(index)?;
+        Ok(
+            &self.data[offset + P_MAIN..offset + P_MAIN + 32] == authority
+                || &self.data[offset + P_SESSION..offset + P_SESSION + 32] == authority,
+        )
+    }
+
+    pub fn mark_event_chunk_delegated(&mut self, index: u16) -> Result<bool, ProgramError> {
+        if self.version() != PROGRAM_VERSION || usize::from(index) >= self.event_chunk_count() {
+            return Err(LabyrinthError::InvalidConfig.into());
+        }
+        let bit = 1u16
+            .checked_shl(u32::from(index))
+            .ok_or(LabyrinthError::InvalidConfig)?;
+        let current = self.delegated_chunk_mask();
+        if current & bit != 0 {
+            return Ok(false);
+        }
+        // A caller cannot skip a rent-bearing chunk and delegate Match early.
+        if current != bit.saturating_sub(1) {
+            return Err(LabyrinthError::DelegationIncomplete.into());
+        }
+        let next = current | bit;
+        write_u16(self.data, H_DELEGATED_CHUNK_MASK, next)?;
+        if next == self.full_chunk_mask() {
+            self.data[H_BOOTSTRAP_FLAGS] |= BOOTSTRAP_FLAG_ALL_CHUNKS_READY;
+        }
+        Ok(true)
+    }
+
+    pub fn require_all_event_chunks_delegated(&self) -> Result<(), ProgramError> {
+        if self.version() != PROGRAM_VERSION
+            || self.delegated_chunk_mask() != self.full_chunk_mask()
+            || self.data[H_BOOTSTRAP_FLAGS] & BOOTSTRAP_FLAG_ALL_CHUNKS_READY == 0
+        {
+            return Err(LabyrinthError::DelegationIncomplete.into());
+        }
+        Ok(())
+    }
+
+    pub fn full_chunk_mask(&self) -> u16 {
+        (1u16 << self.event_chunk_count()).saturating_sub(1)
+    }
+
+    pub fn bootstrap_flags(&self) -> u8 {
+        self.data[H_BOOTSTRAP_FLAGS]
+    }
+
+    pub fn find_authority(&self, authority: &[u8; 32]) -> Result<u16, ProgramError> {
+        for index in 0..usize::from(self.player_count()) {
+            let offset = player_offset(index)?;
+            if &self.data[offset + P_MAIN..offset + P_MAIN + 32] == authority
+                || &self.data[offset + P_SESSION..offset + P_SESSION + 32] == authority
+            {
+                return Ok(index as u16);
+            }
+        }
+        Err(LabyrinthError::UnauthorizedSession.into())
+    }
+
+    pub fn matches_v5_initialization(
+        &self,
+        args: &InitializeMatchV5Args<'_>,
+        canonical_roster: &[u8],
+    ) -> Result<bool, ProgramError> {
+        if self.version() != PROGRAM_VERSION
+            || self.bootstrap_permit_version() != BOOTSTRAP_SCHEMA_V2
+            || self.match_id() != args.match_id
+            || self.match_kind() != args.match_kind
+            || self.er_validator() != args.er_validator
+            || self.finalizer_index() != args.initializer_index
+            || self.data[H_RANKED_MATCH_RECORD..H_RANKED_MATCH_RECORD + 32]
+                != args.ranked_match_record
+            || self.data[H_CONFIG_HASH..H_CONFIG_HASH + 32] != args.config_hash
+            || self.data[H_GENERATION_PROFILE_HASH..H_GENERATION_PROFILE_HASH + 32]
+                != args.generation_profile_hash
+            || read_u16(self.data, H_CONFIG_VERSION)? != args.config_version
+            || read_u16(self.data, H_GENERATION_VERSION)? != args.generation_version
+            || read_u16(self.data, H_ROOM_GENERATION_PROFILE)? != args.room_generation_profile
+            || self.data[H_COMBAT_MODE] != args.combat_mode
+            || self.data[H_PARTY_MODE] != args.party_mode
+            || self.data[H_FRIENDLY_FIRE_RULE] != args.friendly_fire_rule
+            || self.data[H_RESPAWN_ENABLED] != args.respawn_enabled
+            || self.data[H_EXTRACTION_MODE] != args.extraction_mode
+            || self.data[H_EVENT_SCHEMA_VERSION] != args.event_schema_version
+            || self.room_count() != args.room_count
+            || self.player_count() != args.player_count
+            || read_u32(self.data, H_PORTAL_UNLOCK_KILLS)? != args.portal_unlock_kills
+            || read_u16(self.data, H_PORTAL_REQUIRED_PLAYERS)? != args.portal_required_players
+            || read_u16(self.data, H_PORTAL_TYPE_ID)? != args.portal_type_id
+            || self.data[H_RULE_COUNT] != args.rule_count
+            || self.data[H_EVENT_CHUNK_COUNT] != args.event_chunk_count
+            || canonical_roster.len() != usize::from(args.player_count) * ROSTER_ENTRY_LEN
+        {
+            return Ok(false);
+        }
+        for index in 0..usize::from(args.player_count) {
+            let source = index * ROSTER_ENTRY_LEN;
+            let target = player_offset(index)?;
+            if self.data[target + P_MAIN..target + P_MAIN + 32]
+                != canonical_roster[source..source + 32]
+                || self.data[target + P_SESSION..target + P_SESSION + 32]
+                    != canonical_roster[source + 32..source + 64]
+                || read_u16(self.data, target + P_TEAM_ID)?
+                    != u16::from_le_bytes([
+                        canonical_roster[source + 64],
+                        canonical_roster[source + 65],
+                    ])
+                || read_u16(self.data, target + P_PARTY_ID)?
+                    != u16::from_le_bytes([
+                        canonical_roster[source + 66],
+                        canonical_roster[source + 67],
+                    ])
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn install_generation_rules(
+        &mut self,
+        rule_count: u8,
+        rules: &[GenerationRule],
+        encoded_rules: &[u8],
+    ) -> ProgramResult {
+        if self.version() != PROGRAM_VERSION
+            || self.delegated_chunk_mask() != 0
+            || rule_count != self.data[H_RULE_COUNT]
+            || rules.len() != usize::from(rule_count)
+            || encoded_rules.len() != usize::from(rule_count) * RULE_ROW_LEN
+        {
+            return Err(LabyrinthError::InvalidConfig.into());
+        }
+        let count = [rule_count];
+        let actual_hash = hashv(&[RULES_HASH_DOMAIN, &count, encoded_rules]).to_bytes();
+        if self.data[H_GENERATION_PROFILE_HASH..H_GENERATION_PROFILE_HASH + 32] != actual_hash {
+            return Err(LabyrinthError::InvalidConfig.into());
+        }
+        for left in 0..usize::from(rule_count) {
+            let rule = rules[left];
+            if rule.type_id == 0 || rule.weight == 0 || rule.min_difficulty > rule.max_difficulty {
+                return Err(LabyrinthError::InvalidConfig.into());
+            }
+            for right in 0..left {
+                if rule.type_id == rules[right].type_id {
+                    return Err(LabyrinthError::InvalidConfig.into());
+                }
+            }
+            write_rule(self.data, left, rule)?;
+        }
+        Ok(())
     }
 
     pub fn find_session(&self, session: &[u8; 32]) -> Result<u16, ProgramError> {
@@ -926,7 +1194,10 @@ impl<'a> MatchState<'a> {
 }
 
 pub fn validate_match(data: &[u8]) -> Result<(), ProgramError> {
-    if data.len() < MATCH_LEN || data[H_INITIALIZED] != 1 || data[H_VERSION] != PROGRAM_VERSION {
+    if data.len() < MATCH_LEN
+        || data[H_INITIALIZED] != 1
+        || !matches!(data[H_VERSION], LEGACY_PROGRAM_VERSION | PROGRAM_VERSION)
+    {
         return Err(ProgramError::UninitializedAccount);
     }
     Ok(())
@@ -935,7 +1206,14 @@ pub fn validate_match(data: &[u8]) -> Result<(), ProgramError> {
 fn validate_match_input(args: &InitializeMatchArgs<'_>) -> Result<(), ProgramError> {
     let players = usize::from(args.player_count);
     let rooms = usize::from(args.room_count);
-    if args.config_version == 0
+    let ranked_record_is_zero = args.ranked_match_record == [0; 32];
+    let valid_origin = match args.match_kind {
+        MATCH_KIND_RANKED => !ranked_record_is_zero,
+        MATCH_KIND_DIRECT => ranked_record_is_zero,
+        _ => false,
+    };
+    if !valid_origin
+        || args.config_version == 0
         || args.generation_version == 0
         || args.event_schema_version == 0
         || players == 0
@@ -1188,10 +1466,19 @@ mod tests {
     }
 
     fn initialize(players: usize, rooms: usize) -> [u8; MATCH_LEN] {
+        initialize_kind(players, rooms, MATCH_KIND_RANKED)
+    }
+
+    fn initialize_kind(players: usize, rooms: usize, match_kind: u8) -> [u8; MATCH_LEN] {
         let roster = roster(players);
         let args = InitializeMatchArgs {
             match_id: [1; 16],
-            ranked_match_record: [2; 32],
+            match_kind,
+            ranked_match_record: if match_kind == MATCH_KIND_RANKED {
+                [2; 32]
+            } else {
+                [0; 32]
+            },
             config_hash: [3; 32],
             generation_profile_hash: [4; 32],
             config_version: 1,
@@ -1255,6 +1542,9 @@ mod tests {
                 bump: 1,
                 backend_authority: [9; 32],
                 ranked_program: [8; 32],
+                er_validator: [7; 32],
+                finalizer_index: 0,
+                bootstrap_permit_version: BOOTSTRAP_SCHEMA_V2,
                 args,
             },
         )
@@ -1268,6 +1558,109 @@ mod tests {
         assert_eq!(PLAYERS_OFFSET, 544);
         assert_eq!(ROOMS_OFFSET, 1_504);
         assert_eq!(MATCH_LEN, 5_088);
+    }
+
+    #[test]
+    fn ranked_and_direct_origins_are_persisted_without_changing_account_size() {
+        let mut ranked_data = initialize_kind(2, 4, MATCH_KIND_RANKED);
+        let mut direct_data = initialize_kind(2, 4, MATCH_KIND_DIRECT);
+        assert_eq!(
+            MatchState::load(&mut ranked_data).unwrap().match_kind(),
+            MATCH_KIND_RANKED
+        );
+        assert_eq!(
+            MatchState::load(&mut direct_data).unwrap().match_kind(),
+            MATCH_KIND_DIRECT
+        );
+        assert_eq!(ranked_data.len(), direct_data.len());
+    }
+
+    #[test]
+    fn v4_match_accounts_remain_runtime_readable() {
+        let mut data = initialize(2, 4);
+        data[H_VERSION] = LEGACY_PROGRAM_VERSION;
+        let mut state = MatchState::load(&mut data).unwrap();
+        assert_eq!(state.version(), LEGACY_PROGRAM_VERSION);
+        assert_eq!(state.request_match_vrf(0).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn legacy_authority_lookup_keeps_main_wallet_compatibility() {
+        let mut data = initialize(2, 4);
+        let state = MatchState::load(&mut data).unwrap();
+        assert_eq!(state.find_authority(&[1; 32]).unwrap(), 0);
+        assert_eq!(state.find_authority(&[31; 32]).unwrap(), 0);
+        assert!(state.is_finalizer_authority(&[1; 32]).unwrap());
+        assert!(state.is_finalizer_authority(&[31; 32]).unwrap());
+        assert!(state.find_authority(&[99; 32]).is_err());
+    }
+
+    #[test]
+    fn player_paid_v5_uses_only_a_roster_session_key() {
+        let mut data = initialize(2, 4);
+        let state = MatchState::load(&mut data).unwrap();
+        // Player 0's Main Wallet is never a v5 rent/delegation authority.
+        assert!(state.find_session(&[1; 32]).is_err());
+        assert_eq!(state.find_session(&[31; 32]).unwrap(), 0);
+        assert_eq!(state.find_session(&[32; 32]).unwrap(), 1);
+        assert!(state.find_session(&[99; 32]).is_err());
+    }
+
+    #[test]
+    fn event_chunks_are_strictly_ordered_and_match_waits_for_full_mask() {
+        let mut data = initialize(2, 4);
+        let mut state = MatchState::load(&mut data).unwrap();
+        assert!(state.mark_event_chunk_delegated(1).is_err());
+        assert!(state.mark_event_chunk_delegated(0).unwrap());
+        assert!(!state.mark_event_chunk_delegated(0).unwrap());
+        assert!(state.require_all_event_chunks_delegated().is_err());
+        for index in 1..8 {
+            assert!(state.mark_event_chunk_delegated(index).unwrap());
+        }
+        assert_eq!(state.delegated_chunk_mask(), 0x00ff);
+        assert_eq!(state.bootstrap_flags(), 0b11);
+        state.require_all_event_chunks_delegated().unwrap();
+    }
+
+    #[test]
+    fn chunk_zero_rules_are_bound_to_generation_profile_hash() {
+        let mut data = initialize(2, 4);
+        let encoded = [
+            100, 0, 40, 0, 1, 10, 0, 0, 250, 0, 30, 0, 11, 30, 1, 0, 244, 1, 30, 0, 31, 60, 2, 0,
+        ];
+        let count = [3u8];
+        let expected = hashv(&[RULES_HASH_DOMAIN, &count, &encoded]).to_bytes();
+        data[H_GENERATION_PROFILE_HASH..H_GENERATION_PROFILE_HASH + 32].copy_from_slice(&expected);
+        let rules = [
+            GenerationRule {
+                type_id: 100,
+                weight: 40,
+                min_difficulty: 1,
+                max_difficulty: 10,
+                flags: 0,
+            },
+            GenerationRule {
+                type_id: 250,
+                weight: 30,
+                min_difficulty: 11,
+                max_difficulty: 30,
+                flags: 1,
+            },
+            GenerationRule {
+                type_id: 500,
+                weight: 30,
+                min_difficulty: 31,
+                max_difficulty: 60,
+                flags: 2,
+            },
+        ];
+        let mut state = MatchState::load(&mut data).unwrap();
+        state.install_generation_rules(3, &rules, &encoded).unwrap();
+        let mut tampered = encoded;
+        tampered[3] ^= 1;
+        assert!(state
+            .install_generation_rules(3, &rules, &tampered)
+            .is_err());
     }
 
     #[test]

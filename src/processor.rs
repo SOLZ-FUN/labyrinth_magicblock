@@ -1,15 +1,24 @@
 use core::mem::MaybeUninit;
 
 use ephemeral_rollups_pinocchio::{
-    consts::{EXTERNAL_UNDELEGATE_DISCRIMINATOR, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID},
+    consts::{
+        DELEGATION_PROGRAM_ID, EXTERNAL_UNDELEGATE_DISCRIMINATOR, MAGIC_CONTEXT_ID,
+        MAGIC_PROGRAM_ID,
+    },
     instruction::{delegate_account, undelegate},
     intent_bundle::MagicIntentBundleBuilder,
+    pda::{
+        delegate_buffer_pda_from_delegated_account_and_owner_program,
+        delegation_metadata_pda_from_delegated_account,
+        delegation_record_pda_from_delegated_account,
+    },
     types::DelegateConfig,
     vrf::{
         program_identity_pda, scoped_vrf_identity, RequestRandomness, RequestRandomnessCpi,
         DEFAULT_EPHEMERAL_QUEUE, IDENTITY_SEED, VRF_PROGRAM_ID,
     },
 };
+use pinocchio::sysvars::Sysvar;
 use pinocchio::{
     cpi::{Seed, Signer},
     error::ProgramError,
@@ -20,21 +29,29 @@ use solana_sha256_hasher::hashv;
 
 use crate::{
     error::LabyrinthError,
-    events::{event_chunk_pda, initialize_chunk, validate_event_chunks, write_batch},
+    events::{
+        event_chunk_pda, initialize_chunk, validate_event_chunk, validate_event_chunks,
+        write_batch, write_batch_to_chunk, EVENT_CHUNK_LEN,
+    },
     instruction::{
-        match_end_winner_at, match_end_winner_count, parse_authority_event, parse_initialize_match,
-        parse_kill, parse_match_end, parse_player_event, parse_portal_callback, parse_pubkey,
-        parse_room_callback, parse_room_id, IX_COMMIT_AND_UNDELEGATE_MATCH, IX_COMMIT_MATCH,
-        IX_DELEGATE_MATCH, IX_ENTER_OR_REVEAL_ROOM, IX_INITIALIZE_CONFIG, IX_INITIALIZE_MATCH,
-        IX_RECORD_AUTHORITY_EVENT, IX_RECORD_DEATH, IX_RECORD_KILL, IX_RECORD_MATCH_END,
-        IX_RECORD_RESPAWN, IX_REQUEST_MATCH_VRF, IX_RESOLVE_MATCH_VRF, IX_RESOLVE_PORTAL_VRF,
-        IX_RESOLVE_ROOM_VRF, IX_SET_BACKEND_AUTHORITY,
+        match_end_winner_at, match_end_winner_count, parse_authority_event,
+        parse_authorized_initialize_match, parse_delegate_match_v5, parse_delegate_target,
+        parse_initialize_event_chunk_v5, parse_initialize_match_v5, parse_kill, parse_match_end,
+        parse_player_event, parse_portal_callback, parse_pubkey, parse_room_callback,
+        parse_room_id, DELEGATE_TARGET_EVENT_CHUNK, DELEGATE_TARGET_MATCH,
+        IX_COMMIT_AND_UNDELEGATE_MATCH, IX_COMMIT_MATCH, IX_DELEGATE_MATCH, IX_DELEGATE_MATCH_V5,
+        IX_ENTER_OR_REVEAL_ROOM, IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5, IX_INITIALIZE_CONFIG,
+        IX_INITIALIZE_MATCH, IX_INITIALIZE_MATCH_V5, IX_RECORD_AUTHORITY_EVENT, IX_RECORD_DEATH,
+        IX_RECORD_KILL, IX_RECORD_MATCH_END, IX_RECORD_RESPAWN, IX_REQUEST_MATCH_VRF,
+        IX_RESOLVE_MATCH_VRF, IX_RESOLVE_PORTAL_VRF, IX_RESOLVE_ROOM_VRF, IX_SET_BACKEND_AUTHORITY,
+        MATCH_KIND_DIRECT, MATCH_KIND_RANKED,
     },
     pda::{CONFIG_SEED, EVENT_CHUNK_SEED, MATCH_SEED},
-    session::{validate_ranked_match_record, validate_ranked_sessions},
+    session::{canonical_roster_hash, canonicalize_ranked_sessions, validate_ranked_match_record},
+    signature::{verify_prior_ed25519_instruction, verify_prior_ed25519_message},
     state::{
         ConfigState, InitializeMatch, MatchState, CONFIG_LEN, MATCH_LEN, MAX_EVENT_CHUNKS,
-        MAX_PLAYERS, PHASE_TERMINAL,
+        MAX_PLAYERS, PHASE_TERMINAL, PROGRAM_VERSION,
     },
     system::create_pda_account,
 };
@@ -44,6 +61,12 @@ const ROOM_VRF_DOMAIN: &[u8] = b"sol-zero:labyrinth:room-vrf:v1";
 const PORTAL_VRF_DOMAIN: &[u8] = b"sol-zero:labyrinth:portal-vrf:v1";
 const VRF_DATA_BUFFER_LEN: usize = 768;
 const MAGIC_DATA_BUFFER_LEN: usize = 1_280;
+const LAUNCH_PERMIT_DOMAIN: &[u8] = b"solz-labyrinth-launch-permit-v2";
+const BOOTSTRAP_PERMIT_VERSION: u8 = 2;
+
+fn launch_permit_message(program_id: &Address, payload: &[u8]) -> [u8; 32] {
+    hashv(&[LAUNCH_PERMIT_DOMAIN, program_id.as_array(), payload]).to_bytes()
+}
 
 #[inline(never)]
 pub fn process_instruction(
@@ -61,7 +84,7 @@ pub fn process_instruction(
         IX_INITIALIZE_CONFIG => process_initialize_config(program_id, accounts, rest),
         IX_SET_BACKEND_AUTHORITY => process_set_backend_authority(program_id, accounts, rest),
         IX_INITIALIZE_MATCH => process_initialize_match(program_id, accounts, rest),
-        IX_DELEGATE_MATCH => process_delegate_match(program_id, accounts),
+        IX_DELEGATE_MATCH => process_delegate_match(program_id, accounts, rest),
         IX_REQUEST_MATCH_VRF => process_request_match_vrf(program_id, accounts),
         IX_RESOLVE_MATCH_VRF => process_resolve_match_vrf(program_id, accounts, rest),
         IX_ENTER_OR_REVEAL_ROOM => process_enter_or_reveal_room(program_id, accounts, rest),
@@ -74,6 +97,11 @@ pub fn process_instruction(
         IX_RECORD_MATCH_END => process_record_match_end(program_id, accounts, rest),
         IX_COMMIT_MATCH => process_commit(program_id, accounts, false),
         IX_COMMIT_AND_UNDELEGATE_MATCH => process_commit(program_id, accounts, true),
+        IX_INITIALIZE_MATCH_V5 => process_initialize_match_v5(program_id, accounts, rest),
+        IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5 => {
+            process_initialize_and_delegate_event_chunk_v5(program_id, accounts, rest)
+        }
+        IX_DELEGATE_MATCH_V5 => process_delegate_match_v5(program_id, accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -155,46 +183,111 @@ fn process_initialize_match(
     accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    let args = parse_initialize_match(data)?;
+    let authorized = parse_authorized_initialize_match(data)?;
+    let args = authorized.args;
     let player_count = usize::from(args.player_count);
     let event_chunk_count = usize::from(args.event_chunk_count);
-    let required_accounts = 6usize
+    let fixed_account_count = match args.match_kind {
+        MATCH_KIND_RANKED => 6usize,
+        MATCH_KIND_DIRECT => 5usize,
+        _ => return Err(LabyrinthError::InvalidConfig.into()),
+    };
+    let required_accounts = fixed_account_count
         .checked_add(player_count)
         .and_then(|value| value.checked_add(event_chunk_count))
         .ok_or(ProgramError::InvalidInstructionData)?;
     if accounts.len() != required_accounts {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    let (fixed, rest) = accounts.split_at(6);
+    let (fixed, rest) = accounts.split_at(fixed_account_count);
     let payer = &fixed[0];
-    let backend = &fixed[1];
-    let config_account = &fixed[2];
-    let ranked_match_record = &fixed[3];
-    let match_account = &fixed[4];
-    let system_program = &fixed[5];
+    let config_account = &fixed[1];
+    let (ranked_match_record, match_account, system_program) =
+        if args.match_kind == MATCH_KIND_RANKED {
+            (Some(&fixed[2]), &fixed[3], &fixed[4])
+        } else {
+            (None, &fixed[2], &fixed[3])
+        };
+    let instructions_sysvar = if args.match_kind == MATCH_KIND_RANKED {
+        &fixed[5]
+    } else {
+        &fixed[4]
+    };
     let (session_accounts, event_chunks) = rest.split_at(player_count);
-    if !payer.is_signer() || !backend.is_signer() {
+    if !payer.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
     let config = load_config(program_id, config_account)?;
-    if backend.address().as_array() != &config.backend_authority {
-        return Err(ProgramError::IncorrectAuthority);
+    let current_slot = pinocchio::sysvars::clock::Clock::get()?.slot;
+    if authorized.permit_version != BOOTSTRAP_PERMIT_VERSION
+        || authorized.er_validator == [0; 32]
+        || authorized.finalizer_session == [0; 32]
+        || authorized.takeover_slot < current_slot
+        || authorized.expires_slot <= authorized.takeover_slot
+    {
+        return Err(LabyrinthError::InvalidConfig.into());
     }
-    let ranked_program = Address::new_from_array(config.ranked_program);
-    validate_ranked_match_record(
-        &ranked_program,
-        ranked_match_record,
-        &args.ranked_match_record,
-        &args.match_id,
-        args.roster,
-        player_count,
+    if authorized.expires_slot < current_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let permit_message = hashv(&[
+        LAUNCH_PERMIT_DOMAIN,
+        program_id.as_array(),
+        &authorized.finalizer_session,
+        authorized.permit_payload,
+    ])
+    .to_bytes();
+    verify_prior_ed25519_instruction(
+        instructions_sysvar,
+        &config.backend_authority,
+        &authorized.signature,
+        &permit_message,
     )?;
-    validate_ranked_sessions(&ranked_program, session_accounts, args.roster)?;
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    let mut canonical_roster = [0u8; MAX_PLAYERS * crate::instruction::ROSTER_ENTRY_LEN];
+    let canonical_len = player_count * crate::instruction::ROSTER_ENTRY_LEN;
+    canonicalize_ranked_sessions(
+        &ranked_program,
+        session_accounts,
+        args.roster,
+        &mut canonical_roster[..canonical_len],
+    )?;
+    let payer_session = *payer.address().as_array();
+    let finalizer_index = canonical_roster[..canonical_len]
+        .chunks_exact(crate::instruction::ROSTER_ENTRY_LEN)
+        .position(|entry| entry[32..64] == authorized.finalizer_session)
+        .ok_or(LabyrinthError::UnauthorizedSession)?;
+    let payer_is_roster_session = canonical_roster[..canonical_len]
+        .chunks_exact(crate::instruction::ROSTER_ENTRY_LEN)
+        .any(|entry| entry[32..64] == payer_session);
+    if !payer_is_roster_session {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    // The designated finalizer starts the setup. After the signed takeover
+    // slot, any immutable-roster session can safely resume the same bootstrap.
+    if payer_session != authorized.finalizer_session && current_slot < authorized.takeover_slot {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    if let Some(ranked_match_record) = ranked_match_record {
+        validate_ranked_match_record(
+            &ranked_program,
+            ranked_match_record,
+            &args.ranked_match_record,
+            &args.match_id,
+            &canonical_roster[..canonical_len],
+            player_count,
+        )?;
+    } else if args.ranked_match_record != [0; 32] {
+        return Err(LabyrinthError::InvalidConfig.into());
+    }
     let (expected_match, bump) =
         Address::derive_program_address(&[MATCH_SEED, &args.match_id], program_id)
             .ok_or(ProgramError::InvalidSeeds)?;
-    if match_account.address() != &expected_match || match_account.data_len() != 0 {
+    if match_account.address() != &expected_match {
         return Err(ProgramError::InvalidSeeds);
+    }
+    if match_account.data_len() != 0 {
+        return Err(ProgramError::AccountAlreadyInitialized);
     }
     let bump_bytes = [bump];
     let match_seeds = [
@@ -221,6 +314,10 @@ fn process_initialize_match(
         )?;
     }
     let initial_events = {
+        let canonical_args = crate::instruction::InitializeMatchArgs {
+            roster: &canonical_roster[..canonical_len],
+            ..args
+        };
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::initialize(
             &mut match_data,
@@ -228,7 +325,10 @@ fn process_initialize_match(
                 bump,
                 backend_authority: config.backend_authority,
                 ranked_program: config.ranked_program,
-                args,
+                er_validator: authorized.er_validator,
+                finalizer_index: finalizer_index as u8,
+                bootstrap_permit_version: authorized.permit_version,
+                args: canonical_args,
             },
         )?;
         state.initialized_events()?
@@ -243,69 +343,83 @@ fn process_initialize_match(
 }
 
 #[inline(never)]
-fn process_delegate_match(program_id: &Address, accounts: &[AccountView]) -> ProgramResult {
-    if accounts.len() < 8 {
+fn process_delegate_match(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let args = parse_delegate_target(data)?;
+    if accounts.len() != 10 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    let backend = &accounts[0];
-    let owner_program = &accounts[1];
-    let system_program = &accounts[2];
-    let validator = &accounts[3];
-    let match_account = &accounts[4];
-    if !backend.is_signer() || owner_program.address() != program_id {
+    let payer = &accounts[0];
+    // The already-created Match account authorizes the listed session key.
+    // It is duplicated as `target` for the match delegation case.
+    let match_authority = &accounts[1];
+    let owner_program = &accounts[2];
+    let system_program = &accounts[3];
+    let validator = &accounts[4];
+    let delegation_program = &accounts[5];
+    let target = &accounts[6];
+    let buffer = &accounts[7];
+    let delegation_record = &accounts[8];
+    let delegation_metadata = &accounts[9];
+    if !payer.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    let (match_id, match_bump, chunk_count) = {
-        let mut data = match_account.try_borrow_mut()?;
-        let mut state = MatchState::load(&mut data)?;
-        assert_backend_and_match(program_id, backend, match_account, &state)?;
-        state.set_er_validator(*validator.address().as_array());
-        (state.match_id(), state.bump(), state.event_chunk_count())
-    };
-    let expected_len = 4 + (chunk_count + 1) * 4;
-    if accounts.len() != expected_len {
-        return Err(ProgramError::NotEnoughAccountKeys);
+    if owner_program.address() != program_id {
+        return Err(ProgramError::IncorrectProgramId);
     }
-    for group_index in 0..=chunk_count {
-        let offset = 4 + group_index * 4;
-        let pda = &accounts[offset];
-        let buffer = &accounts[offset + 1];
-        let delegation_record = &accounts[offset + 2];
-        let delegation_metadata = &accounts[offset + 3];
-        if group_index == 0 {
-            if pda.address() != match_account.address() {
+    if delegation_program.address() != &DELEGATION_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if !match_authority.owned_by(program_id) || match_authority.data_len() < MATCH_LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    {
+        let mut match_data = match_authority.try_borrow_mut()?;
+        let mut state = MatchState::load(&mut match_data)?;
+        assert_match_pda(program_id, match_authority, &state)?;
+        if state.match_id() != args.match_id {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        state.find_session(payer.address().as_array())?;
+        if state.er_validator() != *validator.address().as_array() {
+            return Err(ProgramError::IncorrectAuthority);
+        }
+        match args.target_kind {
+            DELEGATE_TARGET_EVENT_CHUNK => {
+                if usize::from(args.chunk_index) >= state.event_chunk_count() {
+                    return Err(LabyrinthError::InvalidConfig.into());
+                }
+                state.mark_event_chunk_delegated(args.chunk_index)?;
+            }
+            DELEGATE_TARGET_MATCH => state.require_all_event_chunks_delegated()?,
+            _ => return Err(ProgramError::InvalidInstructionData),
+        }
+    }
+    match args.target_kind {
+        DELEGATE_TARGET_MATCH => {
+            if target.address() != match_authority.address() {
                 return Err(ProgramError::InvalidSeeds);
             }
-            let seed_parts: [&[u8]; 2] = [MATCH_SEED, &match_id];
-            delegate_account(
-                &[
-                    backend,
-                    pda,
-                    owner_program,
-                    buffer,
-                    delegation_record,
-                    delegation_metadata,
-                    system_program,
-                ],
-                &seed_parts,
-                match_bump,
-                DelegateConfig {
-                    commit_frequency_ms: u32::MAX,
-                    validator: Some(validator.address().clone()),
-                },
-            )?;
-        } else {
-            let index = (group_index - 1) as u16;
-            let (expected, bump) = event_chunk_pda(program_id, &match_id, index)?;
-            if pda.address() != &expected {
-                return Err(ProgramError::InvalidSeeds);
+            if !target.owned_by(program_id) || target.data_len() < MATCH_LEN {
+                return Err(ProgramError::InvalidAccountData);
             }
-            let index_bytes = index.to_le_bytes();
-            let seed_parts: [&[u8]; 3] = [EVENT_CHUNK_SEED, &match_id, &index_bytes];
+            let bump = {
+                let mut target_data = target.try_borrow_mut()?;
+                let state = MatchState::load(&mut target_data)?;
+                assert_match_pda(program_id, target, &state)?;
+                if state.match_id() != args.match_id {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                state.bump()
+            };
+            let seed_parts: [&[u8]; 2] = [MATCH_SEED, &args.match_id];
             delegate_account(
                 &[
-                    backend,
-                    pda,
+                    payer,
+                    target,
                     owner_program,
                     buffer,
                     delegation_record,
@@ -318,10 +432,332 @@ fn process_delegate_match(program_id: &Address, accounts: &[AccountView]) -> Pro
                     commit_frequency_ms: u32::MAX,
                     validator: Some(validator.address().clone()),
                 },
-            )?;
+            )
         }
+        DELEGATE_TARGET_EVENT_CHUNK => {
+            validate_event_chunk(program_id, &args.match_id, args.chunk_index, target)?;
+            let (_, bump) = event_chunk_pda(program_id, &args.match_id, args.chunk_index)?;
+            let index_bytes = args.chunk_index.to_le_bytes();
+            let seed_parts: [&[u8]; 3] = [EVENT_CHUNK_SEED, &args.match_id, &index_bytes];
+            delegate_account(
+                &[
+                    payer,
+                    target,
+                    owner_program,
+                    buffer,
+                    delegation_record,
+                    delegation_metadata,
+                    system_program,
+                ],
+                &seed_parts,
+                bump,
+                DelegateConfig {
+                    commit_frequency_ms: u32::MAX,
+                    validator: Some(validator.address().clone()),
+                },
+            )
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
     }
+}
+
+#[inline(never)]
+fn process_initialize_match_v5(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let args = parse_initialize_match_v5(data)?;
+    let player_count = usize::from(args.player_count);
+    let fixed_count = match args.match_kind {
+        MATCH_KIND_RANKED => 6,
+        MATCH_KIND_DIRECT => 5,
+        _ => return Err(LabyrinthError::InvalidConfig.into()),
+    };
+    if accounts.len() != fixed_count + player_count {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let payer = &accounts[0];
+    let config_account = &accounts[1];
+    let (ranked_record, match_account, system_program, instructions_sysvar, sessions) =
+        if args.match_kind == MATCH_KIND_RANKED {
+            (
+                Some(&accounts[2]),
+                &accounts[3],
+                &accounts[4],
+                &accounts[5],
+                &accounts[6..],
+            )
+        } else {
+            (
+                None,
+                &accounts[2],
+                &accounts[3],
+                &accounts[4],
+                &accounts[5..],
+            )
+        };
+    if !payer.is_signer() || !payer.is_writable() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if args.er_validator == [0; 32] {
+        return Err(LabyrinthError::InvalidConfig.into());
+    }
+    let config = load_config(program_id, config_account)?;
+    let current_slot = pinocchio::sysvars::clock::Clock::get()?.slot;
+    if args.expires_slot <= current_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let permit_message = launch_permit_message(program_id, args.permit_payload);
+    verify_prior_ed25519_message(
+        instructions_sysvar,
+        &config.backend_authority,
+        &permit_message,
+    )?;
+
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    let canonical_len = player_count * crate::instruction::ROSTER_ENTRY_LEN;
+    let mut canonical_roster = [0u8; MAX_PLAYERS * crate::instruction::ROSTER_ENTRY_LEN];
+    canonicalize_ranked_sessions(
+        &ranked_program,
+        sessions,
+        args.roster_metadata,
+        &mut canonical_roster[..canonical_len],
+    )?;
+    if canonical_roster_hash(&canonical_roster[..canonical_len]) != args.roster_hash {
+        return Err(LabyrinthError::InvalidRoster.into());
+    }
+    let initializer = usize::from(args.initializer_index) * crate::instruction::ROSTER_ENTRY_LEN;
+    let payer_bytes = payer.address().as_array();
+    if &canonical_roster[initializer + 32..initializer + 64] != payer_bytes
+        && (current_slot < args.takeover_slot
+            || !canonical_roster
+                .chunks_exact(crate::instruction::ROSTER_ENTRY_LEN)
+                .any(|entry| &entry[32..64] == payer_bytes))
+    {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    if let Some(ranked_record) = ranked_record {
+        validate_ranked_match_record(
+            &ranked_program,
+            ranked_record,
+            &args.ranked_match_record,
+            &args.match_id,
+            &canonical_roster[..canonical_len],
+            player_count,
+        )?;
+    } else if args.ranked_match_record != [0; 32] {
+        return Err(LabyrinthError::InvalidConfig.into());
+    }
+
+    let (expected_match, bump) =
+        Address::derive_program_address(&[MATCH_SEED, &args.match_id], program_id)
+            .ok_or(ProgramError::InvalidSeeds)?;
+    if match_account.address() != &expected_match {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if match_account.data_len() != 0 {
+        return validate_existing_match_v5(
+            program_id,
+            match_account,
+            &args,
+            &canonical_roster[..canonical_len],
+        );
+    }
+    let bump_bytes = [bump];
+    let seeds = [
+        Seed::from(MATCH_SEED),
+        Seed::from(args.match_id.as_slice()),
+        Seed::from(&bump_bytes),
+    ];
+    create_pda_account(
+        payer,
+        match_account,
+        system_program,
+        program_id,
+        MATCH_LEN,
+        &seeds,
+    )?;
+    let mut match_data = match_account.try_borrow_mut()?;
+    MatchState::initialize_v5(
+        &mut match_data,
+        bump,
+        config.backend_authority,
+        config.ranked_program,
+        args,
+        &canonical_roster[..canonical_len],
+    )?;
     Ok(())
+}
+
+#[inline(never)]
+fn process_initialize_and_delegate_event_chunk_v5(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let args = parse_initialize_event_chunk_v5(data)?;
+    if accounts.len() != 10 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let payer = &accounts[0];
+    let match_account = &accounts[1];
+    let owner_program = &accounts[2];
+    let system_program = &accounts[3];
+    let validator = &accounts[4];
+    let delegation_program = &accounts[5];
+    let chunk = &accounts[6];
+    let buffer = &accounts[7];
+    let delegation_record = &accounts[8];
+    let delegation_metadata = &accounts[9];
+    if !payer.is_signer() || !payer.is_writable() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if owner_program.address() != program_id
+        || delegation_program.address() != &DELEGATION_PROGRAM_ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let (expected_chunk, chunk_bump) =
+        event_chunk_pda(program_id, &args.match_id, args.chunk_index)?;
+    if chunk.address() != &expected_chunk {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let (fresh, initial_events) = {
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = MatchState::load(&mut match_data)?;
+        assert_match_pda(program_id, match_account, &state)?;
+        if state.version() != PROGRAM_VERSION || state.match_id() != args.match_id {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        state.find_session(payer.address().as_array())?;
+        if state.er_validator() != *validator.address().as_array() {
+            return Err(ProgramError::IncorrectAuthority);
+        }
+        let bit = 1u16 << args.chunk_index;
+        if state.delegated_chunk_mask() & bit != 0 {
+            (false, None)
+        } else {
+            if args.chunk_index == 0 {
+                state.install_generation_rules(
+                    args.rule_count,
+                    &args.rules[..usize::from(args.rule_count)],
+                    args.encoded_rules,
+                )?;
+            }
+            let events = if args.chunk_index == 0 {
+                Some(state.initialized_events()?)
+            } else {
+                None
+            };
+            state.mark_event_chunk_delegated(args.chunk_index)?;
+            (true, events)
+        }
+    };
+    if !fresh {
+        return validate_delegated_chunk_retry(
+            program_id,
+            validator,
+            chunk,
+            buffer,
+            delegation_record,
+            delegation_metadata,
+        );
+    }
+    if chunk.data_len() != 0 {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    initialize_chunk(
+        program_id,
+        payer,
+        chunk,
+        system_program,
+        &args.match_id,
+        args.chunk_index,
+    )?;
+    if let Some(events) = initial_events.as_ref() {
+        write_batch_to_chunk(program_id, &args.match_id, 0, chunk, events)?;
+    }
+    let index_bytes = args.chunk_index.to_le_bytes();
+    let seed_parts: [&[u8]; 3] = [EVENT_CHUNK_SEED, &args.match_id, &index_bytes];
+    delegate_account(
+        &[
+            payer,
+            chunk,
+            owner_program,
+            buffer,
+            delegation_record,
+            delegation_metadata,
+            system_program,
+        ],
+        &seed_parts,
+        chunk_bump,
+        DelegateConfig {
+            commit_frequency_ms: u32::MAX,
+            validator: Some(validator.address().clone()),
+        },
+    )
+}
+
+#[inline(never)]
+fn process_delegate_match_v5(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let match_id = parse_delegate_match_v5(data)?;
+    if accounts.len() != 9 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let payer = &accounts[0];
+    let match_account = &accounts[1];
+    let owner_program = &accounts[2];
+    let system_program = &accounts[3];
+    let validator = &accounts[4];
+    let delegation_program = &accounts[5];
+    let buffer = &accounts[6];
+    let delegation_record = &accounts[7];
+    let delegation_metadata = &accounts[8];
+    if !payer.is_signer() || !payer.is_writable() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if owner_program.address() != program_id
+        || delegation_program.address() != &DELEGATION_PROGRAM_ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let bump = {
+        let mut match_data = match_account.try_borrow_mut()?;
+        let state = MatchState::load(&mut match_data)?;
+        assert_match_pda(program_id, match_account, &state)?;
+        if state.version() != PROGRAM_VERSION || state.match_id() != match_id {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        state.find_session(payer.address().as_array())?;
+        if state.er_validator() != *validator.address().as_array() {
+            return Err(ProgramError::IncorrectAuthority);
+        }
+        state.require_all_event_chunks_delegated()?;
+        state.bump()
+    };
+    let seed_parts: [&[u8]; 2] = [MATCH_SEED, &match_id];
+    delegate_account(
+        &[
+            payer,
+            match_account,
+            owner_program,
+            buffer,
+            delegation_record,
+            delegation_metadata,
+            system_program,
+        ],
+        &seed_parts,
+        bump,
+        DelegateConfig {
+            commit_frequency_ms: u32::MAX,
+            validator: Some(validator.address().clone()),
+        },
+    )
 }
 
 #[inline(never)]
@@ -838,6 +1274,63 @@ fn expected_match_id(
     Ok(state.match_id())
 }
 
+fn validate_existing_match_v5(
+    program_id: &Address,
+    match_account: &AccountView,
+    args: &crate::instruction::InitializeMatchV5Args<'_>,
+    canonical_roster: &[u8],
+) -> ProgramResult {
+    if !match_account.owned_by(program_id) || match_account.data_len() < MATCH_LEN {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    let mut data = match_account.try_borrow_mut()?;
+    let state = MatchState::load(&mut data)?;
+    assert_match_pda(program_id, match_account, &state)?;
+    if !state.matches_v5_initialization(args, canonical_roster)? {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    Ok(())
+}
+
+fn validate_delegated_chunk_retry(
+    program_id: &Address,
+    validator: &AccountView,
+    chunk: &AccountView,
+    buffer: &AccountView,
+    delegation_record: &AccountView,
+    delegation_metadata: &AccountView,
+) -> ProgramResult {
+    if !chunk.owned_by(&DELEGATION_PROGRAM_ID) || chunk.data_len() != EVENT_CHUNK_LEN {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if buffer.address()
+        != &delegate_buffer_pda_from_delegated_account_and_owner_program(
+            chunk.address(),
+            program_id,
+        )
+        || delegation_record.address()
+            != &delegation_record_pda_from_delegated_account(chunk.address())
+        || delegation_metadata.address()
+            != &delegation_metadata_pda_from_delegated_account(chunk.address())
+        || !delegation_record.owned_by(&DELEGATION_PROGRAM_ID)
+        || !delegation_metadata.owned_by(&DELEGATION_PROGRAM_ID)
+    {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let record = delegation_record.try_borrow()?;
+    let metadata = delegation_metadata.try_borrow()?;
+    if record.len() < 72
+        || metadata.len() < 8
+        || record[..8] != 100u64.to_le_bytes()
+        || metadata[..8] != 102u64.to_le_bytes()
+        || record[8..40] != *validator.address().as_array()
+        || record[40..72] != *program_id.as_array()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 fn load_config(
     program_id: &Address,
     config_account: &AccountView,
@@ -851,4 +1344,21 @@ fn load_config(
         return Err(ProgramError::InvalidSeeds);
     }
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permit_digest_binds_program_and_every_payload_byte() {
+        let program = Address::new_from_array([7; 32]);
+        let other_program = Address::new_from_array([8; 32]);
+        let payload = [9u8; 217 + 12 * 4];
+        let expected = launch_permit_message(&program, &payload);
+        let mut tampered = payload;
+        tampered[0] ^= 1;
+        assert_ne!(expected, launch_permit_message(&program, &tampered));
+        assert_ne!(expected, launch_permit_message(&other_program, &payload));
+    }
 }

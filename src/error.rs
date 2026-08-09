@@ -21,6 +21,8 @@ pub enum LabyrinthError {
     PortalNotReady,
     AlreadyRequested,
     DuplicateEvent,
+    AlreadyDelegated,
+    DelegationIncomplete,
 }
 
 impl From<LabyrinthError> for ProgramError {

@@ -4,7 +4,7 @@ use crate::{
     error::LabyrinthError,
     instruction::MAX_EVENT_PAYLOAD,
     pda::EVENT_CHUNK_SEED,
-    state::{MAX_EVENTS_PER_CHUNK, MAX_EVENT_CHUNKS, PROGRAM_VERSION},
+    state::{LEGACY_PROGRAM_VERSION, MAX_EVENTS_PER_CHUNK, MAX_EVENT_CHUNKS, PROGRAM_VERSION},
     system::create_pda_account,
 };
 
@@ -162,21 +162,57 @@ pub fn validate_event_chunks(
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     for (index, chunk) in chunks.iter().enumerate() {
-        let (expected, _) = event_chunk_pda(program_id, match_id, index as u16)?;
-        if chunk.address() != &expected
-            || !chunk.owned_by(program_id)
-            || chunk.data_len() < EVENT_CHUNK_LEN
-        {
-            return Err(ProgramError::InvalidAccountData);
+        validate_event_chunk(program_id, match_id, index as u16, chunk)?;
+    }
+    Ok(())
+}
+
+pub fn validate_event_chunk(
+    program_id: &Address,
+    match_id: &[u8; 16],
+    index: u16,
+    chunk: &AccountView,
+) -> ProgramResult {
+    if usize::from(index) >= MAX_EVENT_CHUNKS {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (expected, _) = event_chunk_pda(program_id, match_id, index)?;
+    if chunk.address() != &expected
+        || !chunk.owned_by(program_id)
+        || chunk.data_len() < EVENT_CHUNK_LEN
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let data = chunk.try_borrow()?;
+    if data[C_INITIALIZED] != 1
+        || !matches!(data[C_VERSION], LEGACY_PROGRAM_VERSION | PROGRAM_VERSION)
+        || data[C_MATCH_ID..C_MATCH_ID + 16] != *match_id
+        || read_u16(&data, C_INDEX)? != index
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+/// Writes a batch whose sequence numbers belong to one just-created chunk.
+/// This is used for MATCH_INITIALIZED before later chunks exist.
+pub fn write_batch_to_chunk(
+    program_id: &Address,
+    match_id: &[u8; 16],
+    chunk_index: u16,
+    chunk: &AccountView,
+    batch: &EventBatch,
+) -> ProgramResult {
+    validate_event_chunk(program_id, match_id, chunk_index, chunk)?;
+    for event in batch.iter() {
+        let zero_index = event
+            .sequence
+            .checked_sub(1)
+            .ok_or(LabyrinthError::InvalidEvent)? as usize;
+        if zero_index / MAX_EVENTS_PER_CHUNK != usize::from(chunk_index) {
+            return Err(LabyrinthError::EventSequenceMismatch.into());
         }
-        let data = chunk.try_borrow()?;
-        if data[C_INITIALIZED] != 1
-            || data[C_VERSION] != PROGRAM_VERSION
-            || data[C_MATCH_ID..C_MATCH_ID + 16] != *match_id
-            || read_u16(&data, C_INDEX)? != index as u16
-        {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        write_event(chunk, event, zero_index % MAX_EVENTS_PER_CHUNK)?;
     }
     Ok(())
 }
@@ -202,33 +238,36 @@ pub fn write_batch(
         if chunk_index >= event_chunk_count {
             return Err(LabyrinthError::EventLogFull.into());
         }
-        let chunk = &chunks[chunk_index];
-        let mut data = chunk.try_borrow_mut()?;
-        let event_count = usize::from(read_u16(&data, C_EVENT_COUNT)?);
-        if event_count != slot {
-            return Err(LabyrinthError::EventSequenceMismatch.into());
-        }
-        if slot == 0 {
-            write_u64(&mut data, C_FIRST_SEQUENCE, event.sequence)?;
-        }
-        let offset = EVENT_CHUNK_HEADER_LEN + slot * EVENT_RECORD_LEN;
-        data[offset..offset + EVENT_RECORD_LEN].fill(0);
-        write_u64(&mut data, offset, event.sequence)?;
-        write_u16(&mut data, offset + 8, event.event_type)?;
-        data[offset + 10] = event.event_version;
-        data[offset + 11] = event.flags;
-        write_u16(&mut data, offset + 12, event.actor_index)?;
-        write_u16(&mut data, offset + 14, event.target_index)?;
-        write_u16(&mut data, offset + 16, event.room_id)?;
-        write_u16(&mut data, offset + 18, event.payload_len)?;
-        let payload_len = usize::from(event.payload_len);
-        if payload_len > MAX_EVENT_PAYLOAD {
-            return Err(LabyrinthError::InvalidEvent.into());
-        }
-        data[offset + 20..offset + 20 + payload_len].copy_from_slice(&event.payload[..payload_len]);
-        write_u16(&mut data, C_EVENT_COUNT, (slot + 1) as u16)?;
+        write_event(&chunks[chunk_index], event, slot)?;
     }
     Ok(())
+}
+
+fn write_event(chunk: &AccountView, event: &MatchEvent, slot: usize) -> ProgramResult {
+    let mut data = chunk.try_borrow_mut()?;
+    let event_count = usize::from(read_u16(&data, C_EVENT_COUNT)?);
+    if event_count != slot {
+        return Err(LabyrinthError::EventSequenceMismatch.into());
+    }
+    if slot == 0 {
+        write_u64(&mut data, C_FIRST_SEQUENCE, event.sequence)?;
+    }
+    let offset = EVENT_CHUNK_HEADER_LEN + slot * EVENT_RECORD_LEN;
+    data[offset..offset + EVENT_RECORD_LEN].fill(0);
+    write_u64(&mut data, offset, event.sequence)?;
+    write_u16(&mut data, offset + 8, event.event_type)?;
+    data[offset + 10] = event.event_version;
+    data[offset + 11] = event.flags;
+    write_u16(&mut data, offset + 12, event.actor_index)?;
+    write_u16(&mut data, offset + 14, event.target_index)?;
+    write_u16(&mut data, offset + 16, event.room_id)?;
+    write_u16(&mut data, offset + 18, event.payload_len)?;
+    let payload_len = usize::from(event.payload_len);
+    if payload_len > MAX_EVENT_PAYLOAD {
+        return Err(LabyrinthError::InvalidEvent.into());
+    }
+    data[offset + 20..offset + 20 + payload_len].copy_from_slice(&event.payload[..payload_len]);
+    write_u16(&mut data, C_EVENT_COUNT, (slot + 1) as u16)
 }
 
 fn read_u16(data: &[u8], offset: usize) -> Result<u16, ProgramError> {
