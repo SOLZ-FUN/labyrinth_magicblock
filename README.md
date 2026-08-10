@@ -7,6 +7,33 @@ leaderboard state.
 
 Configured program: [FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH](https://explorer.solana.com/address/FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH?cluster=devnet).
 
+## Live player test
+
+Ranked Magic Labyrinth is tested from the player-facing entry point:
+
+<https://next.solz.fun/ranked/labyrinth>
+
+The browser flow is intentionally **pre-navigation**. The final locked player
+does not enter a gameplay room until the player-paid v6 bootstrap is confirmed:
+
+1. Open the Ranked Labyrinth tab, connect the existing wallet/session, and
+   enter the ranked queue.
+2. When the roster locks, the finalizer sees the setup progress UI. It first
+   checks the selected Session Key's available setup balance. If that key is
+   underfunded, the UI requests the explicit Main Wallet funding/approval step.
+3. For Ranked only, the finalizer confirms the existing Ranked Matchmaking
+   create-match transaction.
+4. The Session Key then submits `initialize_match_v6` and
+   `delegate_match_v6`; it is the payer/executor. The off-chain game server
+   only signs the permit and verifies accounts read-only.
+5. The UI verifies the delegated ER Match, then opens the Colyseus gameplay
+   room and routes the player to `/game/ranked/labyrinth/:matchId`.
+
+The expected setup labels are: **Checking setup funds → Creating Ranked Match
+→ Initializing Labyrinth → Delegating Labyrinth → Verifying ER → Launching room
+→ Joining room**. A failed/resumed setup remains in **Labyrinth recovery**;
+it must not navigate to the game page early.
+
 ## Deployed proof
 
 The current Devnet program is the v6 binary. It was deployed in slot

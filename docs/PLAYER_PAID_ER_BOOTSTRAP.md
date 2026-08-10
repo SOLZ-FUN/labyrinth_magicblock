@@ -5,6 +5,49 @@ the canonical Ranked Matchmaking match ID for Ranked Labyrinth and a canonical
 Direct match ID for Labyrinth Direct. It does not own Ranked stake, custody,
 payout, withdrawals, or leaderboard data.
 
+## Live UI test: Ranked Magic Labyrinth
+
+The player-facing Ranked Labyrinth entry point is:
+
+<https://next.solz.fun/ranked/labyrinth>
+
+This is the test path for v6. Do **not** manually open a game-match URL first:
+the game page is intentionally subscription-only and assumes the ER world has
+already been initialized and delegated.
+
+### What the player sees
+
+1. The player enters **Ranked Labyrinth** from the URL above and joins the
+   ranked queue using the existing wallet and Session Key.
+2. Once the roster is frozen, the final locked player becomes the initial
+   finalizer. The UI displays a setup screen rather than entering a game room.
+3. The screen shows the selected payer, its available balance, the required
+   setup amount, and the transaction approvals still required.
+4. For ranked play, the finalizer first signs the ordinary Ranked Matchmaking
+   match-creation transaction. Direct Labyrinth skips this step.
+5. The Session Key signs the two v6 Labyrinth transactions: initialize, then
+   delegate. The Main Wallet can fund the Session Key before this point, but it
+   is not the v6 instruction signer.
+6. After a read-only ER verification succeeds, the UI shows **Launching room**
+   and then joins the game. Only then does it navigate to
+   `/game/ranked/labyrinth/:matchId`.
+
+The visible setup phases must appear in this order:
+
+```text
+Checking setup funds
+  -> Creating Ranked Match              (Ranked only)
+  -> Initializing Labyrinth
+  -> Delegating Labyrinth
+  -> Verifying ER
+  -> Launching room
+  -> Joining room
+```
+
+If a wallet approval, rent payment, or transaction confirmation fails, the UI
+stays in **Labyrinth recovery** with the same Match ID. It never creates a
+Colyseus gameplay room or navigates to a match page before ER verification.
+
 ## Authority
 
 Offchain Servers is authoritative for movement, combat, portal occupancy, winner
@@ -60,6 +103,30 @@ sequenceDiagram
     C->>ER: Read-only verification
     C-->>F: Create/join gameplay room
 ```
+
+### v6 authority and navigation flow
+
+```mermaid
+flowchart TD
+    A["Player opens /ranked/labyrinth"] --> B["Queue freezes canonical roster"]
+    B --> C["Finalizer receives immutable launch permit"]
+    C --> D{"Ranked origin?"}
+    D -->|"Yes"| E["Finalizer signs Ranked create-match"]
+    D -->|"Direct"| F["Skip Ranked transaction"]
+    E --> G["Session Key: initialize_match_v6"]
+    F --> G
+    G --> H["Session Key pays rent and delegates Match to MagicBlock ER"]
+    H --> I["Off-chain server verifies ER state read-only"]
+    I -->|"Verified"| J["Create Colyseus gameplay room"]
+    J --> K["Navigate to /game/(ranked/)labyrinth/:matchId"]
+    I -->|"Missing or invalid"| L["Labyrinth recovery: resume same Match ID"]
+    L --> G
+```
+
+This diagram is the v6 boundary: the player executes and pays the chain
+transactions; the off-chain server signs immutable facts, runs gameplay, and
+observes ER. It does not initialize, delegate, pay rent, or create the ER
+world.
 
 The game page does not initialize or delegate. It receives the URL Match ID,
 subscribes to the ready ER account, requests canonical Match VRF, and starts
