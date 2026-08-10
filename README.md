@@ -34,6 +34,28 @@ The expected setup labels are: **Checking setup funds → Creating Ranked Match
 → Joining room**. A failed/resumed setup remains in **Labyrinth recovery**;
 it must not navigate to the game page early.
 
+### v6 player-paid flow
+
+```mermaid
+flowchart TD
+    A["Player opens /ranked/labyrinth"] --> B["Queue freezes canonical roster"]
+    B --> C["Final player receives signed launch permit"]
+    C --> D{"Ranked Labyrinth?"}
+    D -->|"Yes"| E["Player signs Ranked Match creation"]
+    D -->|"Direct"| F["Skip Ranked transaction"]
+    E --> G["Session Key initializes v6 Labyrinth Match"]
+    F --> G
+    G --> H["Session Key delegates Match to MagicBlock ER"]
+    H --> I["Off-chain service verifies ER state read-only"]
+    I -->|"Verified"| J["Open gameplay room"]
+    J --> K["Navigate with canonical Match ID"]
+    I -->|"Not ready"| L["Labyrinth recovery with same Match ID"]
+    L --> G
+```
+
+The player executes and pays the Labyrinth transactions. The off-chain service
+only signs immutable permits, verifies ER state, and runs gameplay authority.
+
 ## Deployed proof
 
 The current Devnet program is the v6 binary. It was deployed in slot
@@ -69,6 +91,25 @@ v6 intentionally trades v5's full event-payload archive for compact canonical
 state plus a rolling event hash and terminal hash. The off-chain gameplay
 service still owns detailed movement/combat logs; the compact Labyrinth account anchors the verifiable
 world/result facts without recording every frame-level event.
+
+### Bootstrap cost and transaction reduction
+
+These are the base setup costs for the default v5 eight-chunk configuration
+versus the v6 compact account. Network fees vary slightly by cluster and
+priority fee, so they are deliberately shown separately from account rent.
+
+| Setup characteristic | v5 default | v6 compact | v6 reduction |
+| --- | ---: | ---: | ---: |
+| Match account rent | 0.036303360 SOL | 0.004454400 SOL | 0.031848960 SOL (87.7%) |
+| EventChunk rent | 0.165703680 SOL (8 chunks) | 0 SOL | 0.165703680 SOL (100%) |
+| Base account rent | 0.202007040 SOL | 0.004454400 SOL | 0.197552640 SOL (97.8%) |
+| Typical bootstrap budget before variable fees | ~0.230153280 SOL | ~0.004454400 SOL | ~0.225698880 SOL (98.1%) |
+| Labyrinth setup transactions | 10 | 2 | 8 fewer (80%) |
+
+v5 retained full event payloads in eight preallocated on-chain chunks. v6
+removes that archive in favor of a compact current-state record, rolling event
+hash, and terminal hash. That intentional storage trade is what makes the
+player-paid setup cheap enough to occur before navigation.
 
 ## v6 compact player-paid bootstrap
 
