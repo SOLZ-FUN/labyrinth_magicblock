@@ -7,7 +7,7 @@ payout, withdrawals, or leaderboard data.
 
 ## Authority
 
-Colyseus is authoritative for movement, combat, portal occupancy, winner
+Offchain Servers is authoritative for movement, combat, portal occupancy, winner
 selection, and the terminal result. It signs immutable launch/terminal facts
 and independently observes ER state. It does not submit Labyrinth program
 transactions and it never pays player account rent.
@@ -36,7 +36,7 @@ account (current base rent constant: 0.0044544 SOL) with:
 This is the tradeoff: v6 makes bootstrap practical for a player payer and
 removes the eight-chunk up-front cost. It retains canonical current state and
 an auditable rolling history commitment, but it does not preserve v5's full
-on-chain event-payload archive. Colyseus still keeps its gameplay/event log;
+on-chain event-payload archive. Offchain Servers still keeps its gameplay/event log;
 the terminal hash anchors the meaningful result on the compact ER account.
 
 ## Bootstrap
@@ -48,7 +48,7 @@ sequenceDiagram
     participant M as Ranked Matchmaking
     participant L as Labyrinth v6
     participant ER as MagicBlock ER
-    participant C as Colyseus
+    participant C as Offchain Servers
     Q->>F: Frozen roster/config and signed launch permit
     alt Ranked Labyrinth
         F->>M: create_authorized_match
@@ -71,11 +71,11 @@ Match VRF establishes the canonical terrain seed and deterministic spawn map.
 Room summaries are written only once, remain stable for every participant, and
 are represented in the compact account. The rolling event hash changes for
 meaningful world events; continuous movement, rotation, projectiles, hits, and
-HP ticks remain in Colyseus and never create on-chain writes.
+HP ticks remain in Offchain Servers and never create on-chain writes.
 
 ## Terminal commit and undelegation
 
-After Colyseus records a terminal result and the compact Match state marks an
+After Offchain Servers records a terminal result and the compact Match state marks an
 extracting player as a winner, that player's Session Key may submit:
 
 ```text
@@ -90,7 +90,7 @@ commit_and_undelegate_match
 
 The program checks the SessionAuthority PDA, Merkle roster proof, compact Match
 PDA, terminal phase, and winner bit before invoking MagicBlock. The player is
-therefore the transaction executor; Colyseus remains the gameplay/result
+therefore the transaction executor; Offchain Servers remains the gameplay/result
 authority and never becomes the payer.
 
 ## Compatibility
