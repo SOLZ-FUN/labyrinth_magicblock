@@ -21,6 +21,55 @@ pub const IX_COMMIT_AND_UNDELEGATE_MATCH: u8 = 15;
 pub const IX_INITIALIZE_MATCH_V5: u8 = 16;
 pub const IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5: u8 = 17;
 pub const IX_DELEGATE_MATCH_V5: u8 = 18;
+pub const IX_INITIALIZE_MATCH_V6: u8 = 19;
+pub const IX_DELEGATE_MATCH_V6: u8 = 20;
+pub const IX_REQUEST_MATCH_VRF_V6: u8 = 21;
+pub const IX_ENTER_OR_REVEAL_ROOM_V6: u8 = 22;
+
+pub const COMPACT_ROSTER_LEAF_LEN: usize = 67;
+pub const MAX_COMPACT_MERKLE_DEPTH: usize = 4;
+
+#[derive(Clone, Copy)]
+pub struct CompactRosterProof<'a> {
+    pub index: u8,
+    pub main_wallet: [u8; 32],
+    pub session_wallet: [u8; 32],
+    pub team_id: u8,
+    pub party_id: u8,
+    pub siblings: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+pub struct InitializeMatchV6Args<'a> {
+    pub match_id: [u8; 16],
+    pub match_kind: u8,
+    pub ranked_match_record: [u8; 32],
+    pub er_validator: [u8; 32],
+    pub roster_root: [u8; 32],
+    pub config_hash: [u8; 32],
+    pub generation_profile_hash: [u8; 32],
+    pub config_version: u16,
+    pub generation_version: u16,
+    pub room_generation_profile: u16,
+    pub combat_mode: u8,
+    pub party_mode: u8,
+    pub friendly_fire_rule: u8,
+    pub respawn_enabled: u8,
+    pub extraction_mode: u8,
+    pub event_schema_version: u8,
+    pub room_count: u8,
+    pub player_count: u8,
+    pub finalizer_index: u8,
+    pub portal_unlock_kills: u16,
+    pub portal_required_players: u8,
+    pub portal_type_id: u16,
+    pub permit_revision: u32,
+    pub takeover_slot: u64,
+    pub expires_slot: u64,
+    pub player_team_party: &'a [u8],
+    pub permit_payload: &'a [u8],
+    pub payer: CompactRosterProof<'a>,
+}
 
 pub const ROSTER_ENTRY_LEN: usize = 68;
 /// `initialize_match` only accepts team/party metadata on the wire. Main and
@@ -429,6 +478,150 @@ pub fn parse_delegate_match_v5(data: &[u8]) -> Result<[u8; 16], ProgramError> {
         .map_err(|_| ProgramError::InvalidInstructionData)
 }
 
+/// Parses the compact v6 bootstrap wire. Only the immutable prefix is signed;
+/// the payer membership proof is verified against the signed roster root.
+pub fn parse_initialize_match_v6(data: &[u8]) -> Result<InitializeMatchV6Args<'_>, ProgramError> {
+    const FIXED_LEN: usize = 217;
+    if data.len() < FIXED_LEN + 2 + COMPACT_ROSTER_LEAF_LEN + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut offset = 0;
+    let match_id = read_array(data, &mut offset)?;
+    let match_kind = read_u8(data, &mut offset)?;
+    let ranked_match_record = read_array(data, &mut offset)?;
+    let er_validator = read_array(data, &mut offset)?;
+    let roster_root = read_array(data, &mut offset)?;
+    let config_hash = read_array(data, &mut offset)?;
+    let generation_profile_hash = read_array(data, &mut offset)?;
+    let config_version = read_u16(data, &mut offset)?;
+    let generation_version = read_u16(data, &mut offset)?;
+    let room_generation_profile = read_u16(data, &mut offset)?;
+    let combat_mode = read_u8(data, &mut offset)?;
+    let party_mode = read_u8(data, &mut offset)?;
+    let friendly_fire_rule = read_u8(data, &mut offset)?;
+    let respawn_enabled = read_u8(data, &mut offset)?;
+    let extraction_mode = read_u8(data, &mut offset)?;
+    let event_schema_version = read_u8(data, &mut offset)?;
+    let room_count = read_u8(data, &mut offset)?;
+    let player_count = read_u8(data, &mut offset)?;
+    let finalizer_index = read_u8(data, &mut offset)?;
+    let portal_unlock_kills = read_u16(data, &mut offset)?;
+    let portal_required_players = read_u8(data, &mut offset)?;
+    let portal_type_id = read_u16(data, &mut offset)?;
+    let permit_revision = read_u32(data, &mut offset)?;
+    let takeover_slot = read_u64(data, &mut offset)?;
+    let expires_slot = read_u64(data, &mut offset)?;
+    if offset != FIXED_LEN
+        || !matches!(match_kind, MATCH_KIND_RANKED | MATCH_KIND_DIRECT)
+        || er_validator == [0; 32]
+        || roster_root == [0; 32]
+        || generation_version != 1
+        || room_generation_profile != 1
+        || room_count == 0
+        || room_count > 20
+        || player_count == 0
+        || usize::from(player_count) > MAX_PLAYERS
+        || finalizer_index >= player_count
+        || portal_required_players == 0
+        || portal_required_players > player_count
+        || takeover_slot >= expires_slot
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let metadata_len = usize::from(player_count) * 2;
+    let permit_end = FIXED_LEN
+        .checked_add(metadata_len)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if data.len() < permit_end + COMPACT_ROSTER_LEAF_LEN + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let player_team_party = &data[offset..permit_end];
+    offset = permit_end;
+    let payer_index = read_u8(data, &mut offset)?;
+    let main_wallet = read_array(data, &mut offset)?;
+    let session_wallet = read_array(data, &mut offset)?;
+    let team_id = read_u8(data, &mut offset)?;
+    let party_id = read_u8(data, &mut offset)?;
+    let depth = usize::from(read_u8(data, &mut offset)?);
+    if payer_index >= player_count || depth > MAX_COMPACT_MERKLE_DEPTH {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let proof_len = depth
+        .checked_mul(32)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if data.len() != offset + proof_len {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(InitializeMatchV6Args {
+        match_id,
+        match_kind,
+        ranked_match_record,
+        er_validator,
+        roster_root,
+        config_hash,
+        generation_profile_hash,
+        config_version,
+        generation_version,
+        room_generation_profile,
+        combat_mode,
+        party_mode,
+        friendly_fire_rule,
+        respawn_enabled,
+        extraction_mode,
+        event_schema_version,
+        room_count,
+        player_count,
+        finalizer_index,
+        portal_unlock_kills,
+        portal_required_players,
+        portal_type_id,
+        permit_revision,
+        takeover_slot,
+        expires_slot,
+        player_team_party,
+        permit_payload: &data[..permit_end],
+        payer: CompactRosterProof {
+            index: payer_index,
+            main_wallet,
+            session_wallet,
+            team_id,
+            party_id,
+            siblings: &data[offset..],
+        },
+    })
+}
+
+pub fn parse_compact_roster_proof(data: &[u8]) -> Result<CompactRosterProof<'_>, ProgramError> {
+    if data.len() < COMPACT_ROSTER_LEAF_LEN + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut offset = 0;
+    let index = read_u8(data, &mut offset)?;
+    let main_wallet = read_array(data, &mut offset)?;
+    let session_wallet = read_array(data, &mut offset)?;
+    let team_id = read_u8(data, &mut offset)?;
+    let party_id = read_u8(data, &mut offset)?;
+    let depth = usize::from(read_u8(data, &mut offset)?);
+    if depth > MAX_COMPACT_MERKLE_DEPTH || data.len() != offset + depth * 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(CompactRosterProof {
+        index,
+        main_wallet,
+        session_wallet,
+        team_id,
+        party_id,
+        siblings: &data[offset..],
+    })
+}
+
+pub fn parse_compact_room_entry(data: &[u8]) -> Result<(u8, CompactRosterProof<'_>), ProgramError> {
+    let (&room_id, proof) = data
+        .split_first()
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    Ok((room_id, parse_compact_roster_proof(proof)?))
+}
+
 pub fn parse_pubkey(data: &[u8]) -> Result<[u8; 32], ProgramError> {
     if data.len() != 32 {
         return Err(ProgramError::InvalidInstructionData);
@@ -765,5 +958,37 @@ mod tests {
         let changed_validator = parse_initialize_match_v5(&init).unwrap();
         assert_ne!(original_validator, changed_validator.er_validator);
         assert!(parse_initialize_match_v5(&init[..init.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn v6_wire_is_compact_session_only_and_rejects_over_twenty_rooms() {
+        const PLAYERS: usize = 2;
+        let mut init = [0u8; 217 + PLAYERS * 2 + COMPACT_ROSTER_LEAF_LEN + 1 + 32];
+        init[16] = MATCH_KIND_DIRECT;
+        init[49] = 1; // validator
+        init[81] = 2; // roster root
+        init[177..179].copy_from_slice(&1u16.to_le_bytes());
+        init[179..181].copy_from_slice(&1u16.to_le_bytes());
+        init[181..183].copy_from_slice(&1u16.to_le_bytes());
+        init[189] = 20;
+        init[190] = PLAYERS as u8;
+        init[191] = 0;
+        init[192..194].copy_from_slice(&1u16.to_le_bytes());
+        init[194] = 1;
+        init[195..197].copy_from_slice(&1u16.to_le_bytes());
+        init[201..209].copy_from_slice(&100u64.to_le_bytes());
+        init[209..217].copy_from_slice(&200u64.to_le_bytes());
+        let payer = 217 + PLAYERS * 2;
+        init[payer] = 0;
+        init[payer + 1] = 3;
+        init[payer + 33] = 4;
+        init[payer + 67] = 1;
+        let parsed = parse_initialize_match_v6(&init).unwrap();
+        assert_eq!(parsed.room_count, 20);
+        assert_eq!(parsed.player_count, 2);
+        assert_eq!(parsed.permit_payload.len(), 221);
+        assert_eq!(parsed.payer.siblings.len(), 32);
+        init[189] = 21;
+        assert!(parse_initialize_match_v6(&init).is_err());
     }
 }

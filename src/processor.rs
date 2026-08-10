@@ -28,6 +28,10 @@ use pinocchio::{
 use solana_sha256_hasher::hashv;
 
 use crate::{
+    compact::{
+        validate_bootstrap_actor, verify_roster_proof_for_count, CompactMatchState,
+        COMPACT_MATCH_LEN, COMPACT_UNDEFINED,
+    },
     error::LabyrinthError,
     events::{
         event_chunk_pda, initialize_chunk, validate_event_chunk, validate_event_chunks,
@@ -35,19 +39,25 @@ use crate::{
     },
     instruction::{
         match_end_winner_at, match_end_winner_count, parse_authority_event,
-        parse_authorized_initialize_match, parse_delegate_match_v5, parse_delegate_target,
-        parse_initialize_event_chunk_v5, parse_initialize_match_v5, parse_kill, parse_match_end,
+        parse_authorized_initialize_match, parse_compact_room_entry, parse_compact_roster_proof,
+        parse_delegate_match_v5, parse_delegate_target, parse_initialize_event_chunk_v5,
+        parse_initialize_match_v5, parse_initialize_match_v6, parse_kill, parse_match_end,
         parse_player_event, parse_portal_callback, parse_pubkey, parse_room_callback,
         parse_room_id, DELEGATE_TARGET_EVENT_CHUNK, DELEGATE_TARGET_MATCH,
         IX_COMMIT_AND_UNDELEGATE_MATCH, IX_COMMIT_MATCH, IX_DELEGATE_MATCH, IX_DELEGATE_MATCH_V5,
-        IX_ENTER_OR_REVEAL_ROOM, IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5, IX_INITIALIZE_CONFIG,
-        IX_INITIALIZE_MATCH, IX_INITIALIZE_MATCH_V5, IX_RECORD_AUTHORITY_EVENT, IX_RECORD_DEATH,
+        IX_DELEGATE_MATCH_V6, IX_ENTER_OR_REVEAL_ROOM, IX_ENTER_OR_REVEAL_ROOM_V6,
+        IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5, IX_INITIALIZE_CONFIG, IX_INITIALIZE_MATCH,
+        IX_INITIALIZE_MATCH_V5, IX_INITIALIZE_MATCH_V6, IX_RECORD_AUTHORITY_EVENT, IX_RECORD_DEATH,
         IX_RECORD_KILL, IX_RECORD_MATCH_END, IX_RECORD_RESPAWN, IX_REQUEST_MATCH_VRF,
-        IX_RESOLVE_MATCH_VRF, IX_RESOLVE_PORTAL_VRF, IX_RESOLVE_ROOM_VRF, IX_SET_BACKEND_AUTHORITY,
-        MATCH_KIND_DIRECT, MATCH_KIND_RANKED,
+        IX_REQUEST_MATCH_VRF_V6, IX_RESOLVE_MATCH_VRF, IX_RESOLVE_PORTAL_VRF, IX_RESOLVE_ROOM_VRF,
+        IX_SET_BACKEND_AUTHORITY, MATCH_KIND_DIRECT, MATCH_KIND_RANKED,
     },
     pda::{CONFIG_SEED, EVENT_CHUNK_SEED, MATCH_SEED},
-    session::{canonical_roster_hash, canonicalize_ranked_sessions, validate_ranked_match_record},
+    session::{
+        canonical_roster_hash, canonicalize_ranked_sessions,
+        validate_compact_ranked_match_record_member, validate_ranked_match_record,
+        validate_session_authority,
+    },
     signature::{verify_prior_ed25519_instruction, verify_prior_ed25519_message},
     state::{
         ConfigState, InitializeMatch, MatchState, CONFIG_LEN, MATCH_LEN, MAX_EVENT_CHUNKS,
@@ -63,9 +73,14 @@ const VRF_DATA_BUFFER_LEN: usize = 768;
 const MAGIC_DATA_BUFFER_LEN: usize = 1_280;
 const LAUNCH_PERMIT_DOMAIN: &[u8] = b"solz-labyrinth-launch-permit-v2";
 const BOOTSTRAP_PERMIT_VERSION: u8 = 2;
+const LAUNCH_PERMIT_V6_DOMAIN: &[u8] = b"solz-labyrinth-launch-permit-v6";
 
 fn launch_permit_message(program_id: &Address, payload: &[u8]) -> [u8; 32] {
     hashv(&[LAUNCH_PERMIT_DOMAIN, program_id.as_array(), payload]).to_bytes()
+}
+
+fn launch_permit_v6_message(program_id: &Address, payload: &[u8]) -> [u8; 32] {
+    hashv(&[LAUNCH_PERMIT_V6_DOMAIN, program_id.as_array(), payload]).to_bytes()
 }
 
 #[inline(never)]
@@ -95,13 +110,17 @@ pub fn process_instruction(
         IX_RESOLVE_PORTAL_VRF => process_resolve_portal_vrf(program_id, accounts, rest),
         IX_RECORD_AUTHORITY_EVENT => process_record_authority_event(program_id, accounts, rest),
         IX_RECORD_MATCH_END => process_record_match_end(program_id, accounts, rest),
-        IX_COMMIT_MATCH => process_commit(program_id, accounts, false),
-        IX_COMMIT_AND_UNDELEGATE_MATCH => process_commit(program_id, accounts, true),
+        IX_COMMIT_MATCH => process_commit(program_id, accounts, rest, false),
+        IX_COMMIT_AND_UNDELEGATE_MATCH => process_commit(program_id, accounts, rest, true),
         IX_INITIALIZE_MATCH_V5 => process_initialize_match_v5(program_id, accounts, rest),
         IX_INITIALIZE_AND_DELEGATE_EVENT_CHUNK_V5 => {
             process_initialize_and_delegate_event_chunk_v5(program_id, accounts, rest)
         }
         IX_DELEGATE_MATCH_V5 => process_delegate_match_v5(program_id, accounts, rest),
+        IX_INITIALIZE_MATCH_V6 => process_initialize_match_v6(program_id, accounts, rest),
+        IX_DELEGATE_MATCH_V6 => process_delegate_match_v6(program_id, accounts, rest),
+        IX_REQUEST_MATCH_VRF_V6 => process_request_match_vrf_v6(program_id, accounts, rest),
+        IX_ENTER_OR_REVEAL_ROOM_V6 => process_enter_or_reveal_room_v6(program_id, accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -760,6 +779,286 @@ fn process_delegate_match_v5(
 }
 
 #[inline(never)]
+fn process_initialize_match_v6(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    let args = parse_initialize_match_v6(data)?;
+    let fixed_count = if args.match_kind == MATCH_KIND_RANKED {
+        7
+    } else {
+        6
+    };
+    if accounts.len() != fixed_count {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let payer = &accounts[0];
+    let payer_session_authority = &accounts[1];
+    let config_account = &accounts[2];
+    let (ranked_record, match_account, system_program, instructions_sysvar) =
+        if args.match_kind == MATCH_KIND_RANKED {
+            (Some(&accounts[3]), &accounts[4], &accounts[5], &accounts[6])
+        } else {
+            (None, &accounts[3], &accounts[4], &accounts[5])
+        };
+    if !payer.is_signer() || !payer.is_writable() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let clock = pinocchio::sysvars::clock::Clock::get()?;
+    validate_bootstrap_actor(
+        payer.address().as_array(),
+        &args.payer,
+        args.finalizer_index,
+        clock.slot,
+        args.takeover_slot,
+        args.expires_slot,
+    )?;
+    if !verify_roster_proof_for_count(&args.roster_root, &args.payer, args.player_count)
+        || args.player_team_party[usize::from(args.payer.index) * 2] != args.payer.team_id
+        || args.player_team_party[usize::from(args.payer.index) * 2 + 1] != args.payer.party_id
+    {
+        return Err(LabyrinthError::InvalidRoster.into());
+    }
+    let config = load_config(program_id, config_account)?;
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    validate_session_authority(
+        &ranked_program,
+        payer_session_authority,
+        &args.payer.main_wallet,
+        &args.payer.session_wallet,
+    )?;
+    if let Some(record) = ranked_record {
+        validate_compact_ranked_match_record_member(
+            &ranked_program,
+            record,
+            &args.ranked_match_record,
+            &args.match_id,
+            usize::from(args.player_count),
+            usize::from(args.payer.index),
+            &args.payer.main_wallet,
+        )?;
+    } else if args.ranked_match_record != [0; 32] {
+        return Err(LabyrinthError::InvalidConfig.into());
+    }
+    let permit_message = launch_permit_v6_message(program_id, args.permit_payload);
+    verify_prior_ed25519_message(
+        instructions_sysvar,
+        &config.backend_authority,
+        &permit_message,
+    )?;
+    let (expected_match, bump) =
+        Address::derive_program_address(&[MATCH_SEED, &args.match_id], program_id)
+            .ok_or(ProgramError::InvalidSeeds)?;
+    if match_account.address() != &expected_match {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if match_account.data_len() != 0 {
+        if !match_account.owned_by(program_id) || match_account.data_len() != COMPACT_MATCH_LEN {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+        let mut existing_data = match_account.try_borrow_mut()?;
+        let existing = CompactMatchState::load(&mut existing_data)?;
+        assert_compact_match_pda(program_id, match_account, &existing)?;
+        if existing.match_id() != args.match_id
+            || existing.ranked_match_record() != args.ranked_match_record
+            || existing.er_validator() != args.er_validator
+            || existing.roster_root() != args.roster_root
+            || existing.config_hash() != args.config_hash
+            || existing.generation_profile_hash() != args.generation_profile_hash
+            || existing.finalizer_index() != args.finalizer_index
+            || existing.takeover_slot() != args.takeover_slot
+        {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+        return existing.verify_member(&args.payer).map(|_| ());
+    }
+    let bump_bytes = [bump];
+    let seeds = [
+        Seed::from(MATCH_SEED),
+        Seed::from(args.match_id.as_slice()),
+        Seed::from(&bump_bytes),
+    ];
+    create_pda_account(
+        payer,
+        match_account,
+        system_program,
+        program_id,
+        COMPACT_MATCH_LEN,
+        &seeds,
+    )?;
+    let mut match_data = match_account.try_borrow_mut()?;
+    CompactMatchState::initialize(&mut match_data, bump, config.backend_authority, &args)?;
+    Ok(())
+}
+
+#[inline(never)]
+fn process_delegate_match_v6(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    if accounts.len() != 11 || data.len() < 16 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let match_id: [u8; 16] = data[..16]
+        .try_into()
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let proof = parse_compact_roster_proof(&data[16..])?;
+    let payer = &accounts[0];
+    let session_authority = &accounts[1];
+    let config_account = &accounts[2];
+    let match_account = &accounts[3];
+    let owner_program = &accounts[4];
+    let system_program = &accounts[5];
+    let validator = &accounts[6];
+    let delegation_program = &accounts[7];
+    let buffer = &accounts[8];
+    let delegation_record = &accounts[9];
+    let delegation_metadata = &accounts[10];
+    if !payer.is_signer()
+        || !payer.is_writable()
+        || payer.address().as_array() != &proof.session_wallet
+    {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    if owner_program.address() != program_id
+        || delegation_program.address() != &DELEGATION_PROGRAM_ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if match_account.owned_by(&DELEGATION_PROGRAM_ID) {
+        return validate_delegated_match_retry(
+            program_id,
+            validator,
+            match_account,
+            buffer,
+            delegation_record,
+            delegation_metadata,
+            COMPACT_MATCH_LEN,
+        );
+    }
+    let config = load_config(program_id, config_account)?;
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    let bump = {
+        let mut match_data = match_account.try_borrow_mut()?;
+        let state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_match_pda(program_id, match_account, &state)?;
+        if state.match_id() != match_id || state.er_validator() != *validator.address().as_array() {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        state.verify_member(&proof)?;
+        state.bump()
+    };
+    validate_session_authority(
+        &ranked_program,
+        session_authority,
+        &proof.main_wallet,
+        &proof.session_wallet,
+    )?;
+    let seed_parts: [&[u8]; 2] = [MATCH_SEED, &match_id];
+    delegate_account(
+        &[
+            payer,
+            match_account,
+            owner_program,
+            buffer,
+            delegation_record,
+            delegation_metadata,
+            system_program,
+        ],
+        &seed_parts,
+        bump,
+        DelegateConfig {
+            commit_frequency_ms: u32::MAX,
+            validator: Some(validator.address().clone()),
+        },
+    )
+}
+
+#[inline(never)]
+fn process_request_match_vrf_v6(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    if accounts.len() != 9 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let proof = parse_compact_roster_proof(data)?;
+    let payer = &accounts[0];
+    let session_authority = &accounts[1];
+    let config = load_config(program_id, &accounts[2])?;
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    let match_account = &accounts[3];
+    assert_vrf_request_accounts(program_id, payer, &accounts[4], &accounts[5], &accounts[8])?;
+    if payer.address().as_array() != &proof.session_wallet {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    let (match_id, nonce) = {
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_match_pda(program_id, match_account, &state)?;
+        let requester = state.verify_member(&proof)?;
+        let nonce = state.request_match_vrf(requester)?;
+        (state.match_id(), nonce)
+    };
+    validate_session_authority(
+        &ranked_program,
+        session_authority,
+        &proof.main_wallet,
+        &proof.session_wallet,
+    )?;
+    let nonce_bytes = nonce.to_le_bytes();
+    let caller_seed = hashv(&[MATCH_VRF_DOMAIN, &match_id, &nonce_bytes]).to_bytes();
+    request_vrf(
+        program_id,
+        payer,
+        match_account,
+        &accounts[4],
+        &accounts[5],
+        &accounts[6],
+        &accounts[7],
+        &accounts[8],
+        &[],
+        caller_seed,
+        &[IX_RESOLVE_MATCH_VRF],
+        &[],
+    )
+}
+
+#[inline(never)]
+fn process_enter_or_reveal_room_v6(
+    program_id: &Address,
+    accounts: &[AccountView],
+    data: &[u8],
+) -> ProgramResult {
+    if accounts.len() != 4 {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let (room, proof) = parse_compact_room_entry(data)?;
+    let payer = &accounts[0];
+    let session_authority = &accounts[1];
+    let config = load_config(program_id, &accounts[2])?;
+    let ranked_program = Address::new_from_array(config.ranked_program);
+    let match_account = &accounts[3];
+    if !payer.is_signer() || payer.address().as_array() != &proof.session_wallet {
+        return Err(LabyrinthError::UnauthorizedSession.into());
+    }
+    validate_session_authority(
+        &ranked_program,
+        session_authority,
+        &proof.main_wallet,
+        &proof.session_wallet,
+    )?;
+    let mut match_data = match_account.try_borrow_mut()?;
+    let mut state = CompactMatchState::load(&mut match_data)?;
+    assert_compact_match_pda(program_id, match_account, &state)?;
+    let revealer = state.verify_member(&proof)?;
+    state.reveal_room(room, revealer).map(|_| ())
+}
+
+#[inline(never)]
 fn process_request_match_vrf(program_id: &Address, accounts: &[AccountView]) -> ProgramResult {
     let (header, chunks) = split_vrf_and_chunks(accounts)?;
     let payer = &header[0];
@@ -811,6 +1110,16 @@ fn process_resolve_match_vrf(
         .try_into()
         .map_err(|_| ProgramError::InvalidInstructionData)?;
     let match_account = &accounts[1];
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if accounts.len() != 2 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_match_pda(program_id, match_account, &state)?;
+        let nonce = state.match_vrf_nonce();
+        return state.resolve_match_vrf(randomness, nonce);
+    }
     let chunks = &accounts[2..];
     let mut match_data = match_account.try_borrow_mut()?;
     let mut state = MatchState::load(&mut match_data)?;
@@ -914,6 +1223,20 @@ fn process_record_kill(
     data: &[u8],
 ) -> ProgramResult {
     let (killer, victim, room_id, event_id) = parse_kill(data)?;
+    if accounts.len() == 2 && accounts[1].data_len() == COMPACT_MATCH_LEN {
+        let backend = &accounts[0];
+        let match_account = &accounts[1];
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_backend_and_match(program_id, backend, match_account, &state)?;
+        state.record_kill(
+            u8::try_from(killer).map_err(|_| LabyrinthError::InvalidRoster)?,
+            u8::try_from(victim).map_err(|_| LabyrinthError::InvalidRoster)?,
+            u8::try_from(room_id).map_err(|_| LabyrinthError::InvalidRoom)?,
+            event_id,
+        )?;
+        return Ok(());
+    }
     let (header, chunks) = split_vrf_and_chunks(accounts)?;
     let backend = &header[0];
     let match_account = &header[1];
@@ -961,6 +1284,19 @@ fn process_record_death(
 ) -> ProgramResult {
     let (victim, room_id, event_id) = parse_player_event(data)?;
     let (backend, match_account, chunks) = split_backend_event_accounts(accounts)?;
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if !chunks.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_backend_and_match(program_id, backend, match_account, &state)?;
+        return state.record_death(
+            u8::try_from(victim).map_err(|_| LabyrinthError::InvalidRoster)?,
+            u8::try_from(room_id).map_err(|_| LabyrinthError::InvalidRoom)?,
+            event_id,
+        );
+    }
     let (match_id, events, chunk_count) = {
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::load(&mut match_data)?;
@@ -979,6 +1315,18 @@ fn process_record_respawn(
 ) -> ProgramResult {
     let (player, _, event_id) = parse_player_event(data)?;
     let (backend, match_account, chunks) = split_backend_event_accounts(accounts)?;
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if !chunks.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_backend_and_match(program_id, backend, match_account, &state)?;
+        return state.record_respawn(
+            u8::try_from(player).map_err(|_| LabyrinthError::InvalidRoster)?,
+            event_id,
+        );
+    }
     let (match_id, events, chunk_count) = {
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::load(&mut match_data)?;
@@ -1001,6 +1349,15 @@ fn process_resolve_portal_vrf(
     }
     assert_scoped_vrf_callback(program_id, &accounts[0])?;
     let match_account = &accounts[1];
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if accounts.len() != 2 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_match_pda(program_id, match_account, &state)?;
+        return state.resolve_portal_vrf(randomness, nonce);
+    }
     let (match_id, events, chunk_count) = {
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::load(&mut match_data)?;
@@ -1019,6 +1376,24 @@ fn process_record_authority_event(
 ) -> ProgramResult {
     let args = parse_authority_event(data)?;
     let (backend, match_account, chunks) = split_backend_event_accounts(accounts)?;
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if !chunks.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_backend_and_match(program_id, backend, match_account, &state)?;
+        return state.append_authority_event(
+            args.event_type,
+            args.event_version,
+            args.flags,
+            u8::try_from(args.actor_index).unwrap_or(COMPACT_UNDEFINED),
+            u8::try_from(args.target_index).unwrap_or(COMPACT_UNDEFINED),
+            u8::try_from(args.room_id).unwrap_or(COMPACT_UNDEFINED),
+            args.event_id,
+            args.payload,
+        );
+    }
     let (match_id, events, chunk_count) = {
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::load(&mut match_data)?;
@@ -1051,6 +1426,22 @@ fn process_record_match_end(
         *winner = match_end_winner_at(&args, index)?;
     }
     let (backend, match_account, chunks) = split_backend_event_accounts(accounts)?;
+    if match_account.data_len() == COMPACT_MATCH_LEN {
+        if !chunks.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut winner_mask = 0u16;
+        for winner in winners.iter().take(winner_count) {
+            if usize::from(*winner) >= MAX_PLAYERS {
+                return Err(LabyrinthError::InvalidWinnerSet.into());
+            }
+            winner_mask |= 1u16 << *winner;
+        }
+        let mut match_data = match_account.try_borrow_mut()?;
+        let mut state = CompactMatchState::load(&mut match_data)?;
+        assert_compact_backend_and_match(program_id, backend, match_account, &state)?;
+        return state.finish(winner_mask, args.result_hash, args.event_id);
+    }
     let (match_id, events, chunk_count) = {
         let mut match_data = match_account.try_borrow_mut()?;
         let mut state = MatchState::load(&mut match_data)?;
@@ -1066,8 +1457,59 @@ fn process_record_match_end(
 fn process_commit(
     program_id: &Address,
     accounts: &[AccountView],
+    data: &[u8],
     undelegate_after: bool,
 ) -> ProgramResult {
+    if accounts.len() == 6 && accounts[3].data_len() == COMPACT_MATCH_LEN {
+        let proof = parse_compact_roster_proof(data)?;
+        let payer = &accounts[0];
+        let session_authority = &accounts[1];
+        let config = load_config(program_id, &accounts[2])?;
+        let match_account = &accounts[3];
+        let magic_context = &accounts[4];
+        let magic_program = &accounts[5];
+        if !payer.is_signer() || payer.address().as_array() != &proof.session_wallet {
+            return Err(LabyrinthError::UnauthorizedSession.into());
+        }
+        validate_session_authority(
+            &Address::new_from_array(config.ranked_program),
+            session_authority,
+            &proof.main_wallet,
+            &proof.session_wallet,
+        )?;
+        {
+            let mut match_data = match_account.try_borrow_mut()?;
+            let state = CompactMatchState::load(&mut match_data)?;
+            assert_compact_match_pda(program_id, match_account, &state)?;
+            let player = state.verify_member(&proof)?;
+            if state.phase() != PHASE_TERMINAL || state.winner_mask() & (1u16 << player) == 0 {
+                return Err(LabyrinthError::MatchNotTerminal.into());
+            }
+        }
+        if magic_context.address() != &MAGIC_CONTEXT_ID
+            || magic_program.address() != &MAGIC_PROGRAM_ID
+        {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let mut buffer = [0u8; MAGIC_DATA_BUFFER_LEN];
+        let builder = MagicIntentBundleBuilder::new(
+            payer.clone(),
+            magic_context.clone(),
+            magic_program.clone(),
+        );
+        return if undelegate_after {
+            builder
+                .commit_and_undelegate(core::slice::from_ref(match_account))
+                .build_and_invoke(&mut buffer)
+        } else {
+            builder
+                .commit(core::slice::from_ref(match_account))
+                .build_and_invoke(&mut buffer)
+        };
+    }
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if accounts.len() < 5 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
@@ -1200,7 +1642,7 @@ fn split_vrf_and_chunks(
 fn split_backend_event_accounts(
     accounts: &[AccountView],
 ) -> Result<(&AccountView, &AccountView, &[AccountView]), ProgramError> {
-    if accounts.len() < 3 {
+    if accounts.len() < 2 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let (fixed, chunks) = accounts.split_at(2);
@@ -1261,6 +1703,32 @@ fn assert_match_pda(
         return Err(ProgramError::InvalidSeeds);
     }
     Ok(())
+}
+
+fn assert_compact_match_pda(
+    program_id: &Address,
+    match_account: &AccountView,
+    state: &CompactMatchState<'_>,
+) -> ProgramResult {
+    let match_id = state.match_id();
+    let expected =
+        Address::derive_address(&[MATCH_SEED, &match_id], Some(state.bump()), program_id);
+    if match_account.address() != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(())
+}
+
+fn assert_compact_backend_and_match(
+    program_id: &Address,
+    backend: &AccountView,
+    match_account: &AccountView,
+    state: &CompactMatchState<'_>,
+) -> ProgramResult {
+    if !backend.is_signer() || backend.address().as_array() != &state.backend_authority() {
+        return Err(ProgramError::IncorrectAuthority);
+    }
+    assert_compact_match_pda(program_id, match_account, state)
 }
 
 fn expected_match_id(
@@ -1330,6 +1798,46 @@ fn validate_delegated_chunk_retry(
     Ok(())
 }
 
+fn validate_delegated_match_retry(
+    program_id: &Address,
+    validator: &AccountView,
+    match_account: &AccountView,
+    buffer: &AccountView,
+    delegation_record: &AccountView,
+    delegation_metadata: &AccountView,
+    expected_len: usize,
+) -> ProgramResult {
+    if !match_account.owned_by(&DELEGATION_PROGRAM_ID) || match_account.data_len() != expected_len {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if buffer.address()
+        != &delegate_buffer_pda_from_delegated_account_and_owner_program(
+            match_account.address(),
+            program_id,
+        )
+        || delegation_record.address()
+            != &delegation_record_pda_from_delegated_account(match_account.address())
+        || delegation_metadata.address()
+            != &delegation_metadata_pda_from_delegated_account(match_account.address())
+        || !delegation_record.owned_by(&DELEGATION_PROGRAM_ID)
+        || !delegation_metadata.owned_by(&DELEGATION_PROGRAM_ID)
+    {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let record = delegation_record.try_borrow()?;
+    let metadata = delegation_metadata.try_borrow()?;
+    if record.len() < 72
+        || metadata.len() < 8
+        || record[..8] != 100u64.to_le_bytes()
+        || metadata[..8] != 102u64.to_le_bytes()
+        || record[8..40] != *validator.address().as_array()
+        || record[40..72] != *program_id.as_array()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 fn load_config(
     program_id: &Address,
     config_account: &AccountView,
@@ -1359,5 +1867,16 @@ mod tests {
         tampered[0] ^= 1;
         assert_ne!(expected, launch_permit_message(&program, &tampered));
         assert_ne!(expected, launch_permit_message(&other_program, &payload));
+    }
+
+    #[test]
+    fn v6_permit_digest_is_domain_separated_and_mutation_bound() {
+        let program = Address::new_from_array([7; 32]);
+        let payload = [11u8; 217 + 12 * 2];
+        let expected = launch_permit_v6_message(&program, &payload);
+        let mut changed = payload;
+        changed[216] ^= 1; // expiry/finalizer/config prefix is signed.
+        assert_ne!(expected, launch_permit_v6_message(&program, &changed));
+        assert_ne!(expected, launch_permit_message(&program, &payload));
     }
 }

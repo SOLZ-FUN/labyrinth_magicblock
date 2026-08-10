@@ -1,162 +1,107 @@
-# Player-paid Ephemeral Rollup bootstrap
+# Compact v6 player-paid ER flow
 
-## Authority and permit
+`labyrinth_pinocchio` v6 is the deployed player-paid Labyrinth path. It uses
+the canonical Ranked Matchmaking match ID for Ranked Labyrinth and a canonical
+Direct match ID for Labyrinth Direct. It does not own Ranked stake, custody,
+payout, withdrawals, or leaderboard data.
 
-Labyrinth v5 is a player-paid bootstrap protocol. The canonical Ranked
-Matchmaking match ID is also the Labyrinth match ID. The configured program is
-[FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH](https://explorer.solana.com/address/FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH?cluster=devnet).
+## Authority
 
-The selected finalizer's existing **Session Key** normally signs and pays
-Match-account rent, Event Chunk rent, and delegation fees. If it does not
-cover the complete preflight, the corresponding **Main Wallet** can be
-explicitly selected as payer and signer for the same bootstrap. Both paths are
-limited to the designated initializer during creation; neither gives Labyrinth
-authority over Ranked stake or payout. MagicBlock ER executes delegated state;
-it is not a separate player wallet.
+Colyseus is authoritative for movement, combat, portal occupancy, winner
+selection, and the terminal result. It signs immutable launch/terminal facts
+and independently observes ER state. It does not submit Labyrinth program
+transactions and it never pays player account rent.
 
-Colyseus freezes roster/configuration, signs an immutable launch permit, and
-observes the ER world. It remains authoritative for movement, combat, portal
-occupancy, and winner selection. It never submits or pays
-`initialize_match`/delegation transactions.
+The selected player's existing Session Key signs and pays v6 Match creation,
+delegation, VRF/reveal requests, and post-match commit. The corresponding Main
+Wallet may fund that Session Key before setup. Every player action presents a
+Merkle membership proof bound to the backend-signed roster root; an outside
+wallet cannot substitute itself.
 
-The preceding Ed25519 permit binds program ID, canonical match ID, Ranked
-MatchRecord (or zero for Direct), locked roster/Session Authorities, immutable
-configuration and rules hashes, ER validator, finalizer index, Main-or-Session
-payer policy, permit revision, and Unix expiry time. Altering a signed input
-invalidates the permit.
+## Why v6 replaces the eight v5 chunks
 
-## Ranked: two confirmed stages
+v5 preallocated one 5,088-byte Match account and eight 2,848-byte EventChunk
+accounts. That gave 256 persisted event payload slots, but required ten setup
+transactions and roughly 0.23 SOL of setup rent/metadata/fee budget.
 
-“Two stages” does not mean exactly two physical transactions. The Labyrinth
-stage may create/delegate the Match and each Event Chunk independently so it
-can resume safely.
+v6 deliberately does not use EventChunks. It uses one 512-byte compact Match
+account (current base rent constant: 0.0044544 SOL) with:
+
+- the canonical match ID, origin, Ranked MatchRecord reference, and validator;
+- a Merkle root for the Main-Wallet/Session-Key roster;
+- deterministic initial spawns and up to 20 room summaries;
+- portal, kill, death, respawn, winner, and terminal state;
+- an append-only rolling event hash and terminal result hash.
+
+This is the tradeoff: v6 makes bootstrap practical for a player payer and
+removes the eight-chunk up-front cost. It retains canonical current state and
+an auditable rolling history commitment, but it does not preserve v5's full
+on-chain event-payload archive. Colyseus still keeps its gameplay/event log;
+the terminal hash anchors the meaningful result on the compact ER account.
+
+## Bootstrap
 
 ```mermaid
 sequenceDiagram
-    participant Q as Ranked queue
-    participant F as Final player payer
+    participant Q as Ranked or Direct queue
+    participant F as Final player Session Key
     participant M as Ranked Matchmaking
-    participant W as Main Wallet when needed
-    participant L as Labyrinth program
+    participant L as Labyrinth v6
     participant ER as MagicBlock ER
     participant C as Colyseus
-    Q->>F: Lock roster and signed permit
-    F->>M: create_authorized_match, confirmed
-    F->>F: Rent and fee preflight
-    alt Session Key does not cover the complete estimate
-        W->>L: Main Wallet explicitly signs and pays the same bootstrap
+    Q->>F: Frozen roster/config and signed launch permit
+    alt Ranked Labyrinth
+        F->>M: create_authorized_match
+        M-->>F: Locked Ranked MatchRecord
     end
-    F->>L: Initialize v5 Match
-    loop Event Chunks 0 to N-1
-        F->>L: Create and delegate Event Chunk
-    end
-    F->>L: Delegate Match last
-    L->>ER: Shared world available
-    C->>ER: Observe readiness
-    ER-->>F: Verify ER state
-    F->>C: Transition into game
+    F->>L: initialize_match_v6
+    F->>L: delegate_match_v6
+    L->>ER: Compact world available
+    C->>ER: Read-only verification
+    C-->>F: Create/join gameplay room
 ```
 
-Ranked Matchmaking and Ranked Leaderboard remain untouched: Ranked handles
-money, while Labyrinth owns verifiable world state.
+The game page does not initialize or delegate. It receives the URL Match ID,
+subscribes to the ready ER account, requests canonical Match VRF, and starts
+terrain generation only after the world is verified.
 
-## Direct: immediate player-paid stage
+## Gameplay and room state
 
-Direct skips Ranked creation and immediately completes the same player-paid
-bootstrap after finalizer selection.
+Match VRF establishes the canonical terrain seed and deterministic spawn map.
+Room summaries are written only once, remain stable for every participant, and
+are represented in the compact account. The rolling event hash changes for
+meaningful world events; continuous movement, rotation, projectiles, hits, and
+HP ticks remain in Colyseus and never create on-chain writes.
 
-```mermaid
-sequenceDiagram
-    participant C as Colyseus
-    participant F as Selected player payer
-    participant L as Labyrinth program
-    participant ER as MagicBlock ER
-    C->>F: Frozen Direct roster/config and signed permit
-    F->>F: Session-Key balance preflight
-    F->>L: Initialize v5 Match
-    F->>L: Create and delegate chunks 0 to N-1
-    F->>L: Delegate Match last
-    L->>ER: Shared world executes
-    ER-->>C: Readiness observed
-    C-->>F: Game transition allowed
+## Terminal commit and undelegation
+
+After Colyseus records a terminal result and the compact Match state marks an
+extracting player as a winner, that player's Session Key may submit:
+
+```text
+commit_match
 ```
 
-## Payer selection
+or:
 
-```mermaid
-flowchart TD
-    A[Session-Key complete-cost preflight] --> B{Enough rent plus fee buffer?}
-    B -- Yes --> C[Session Key signs and pays]
-    B -- No --> D[Prompt for Main Wallet approval]
-    D --> E[Main Wallet signs and pays]
-    C --> F[Same permit, Match ID, and roster]
-    E --> F
+```text
+commit_and_undelegate_match
 ```
 
-## Recovery and delegation order
+The program checks the SessionAuthority PDA, Merkle roster proof, compact Match
+PDA, terminal phase, and winner bit before invoking MagicBlock. The player is
+therefore the transaction executor; Colyseus remains the gameplay/result
+authority and never becomes the payer.
 
-Event Chunks are delegated **first**, in index order. The Match is delegated
-only when its persistent chunk-delegation mask proves every configured chunk
-is ready. Repeated calls verify an existing correct account/delegation instead
-of charging rent twice.
+## Compatibility
 
-```mermaid
-sequenceDiagram
-    participant F as Selected finalizer authority
-    participant R as Locked-roster Main Wallet or Session Key
-    participant L as Labyrinth program
-    participant ER as MagicBlock ER
-    F->>L: Initialize and delegate chunks 0 through k
-    F--xER: Disconnect
-    Note over R,L: Initial creation requires the designated finalizer
-    Note over R,L: After Match creation, any roster authority may resume
-    R->>L: Verify identical state and delegated chunks
-    R->>L: Resume missing chunks
-    R->>L: Delegate Match last
-    L->>ER: Ready
-```
+Existing v4 and v5 Match accounts remain readable by the legacy runtime paths.
+New v6 worlds are limited to 20 rooms and 12 players, use compact roster proofs,
+and use the v6 permit domain. A v5 account is not silently interpreted as v6.
 
-Takeover cannot change roster, configuration, validator, or canonical match
-ID. Before Match creation the server issues a new permit revision to the next
-finalizer. After creation, any locked-roster Main Wallet or Session Key may
-finish only the missing chunk/Match delegation operations.
+## Deployment
 
-## Rent estimate
+Configured program: [FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH](https://explorer.solana.com/address/FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH?cluster=devnet).
 
-The current default has one 5,088-byte Match account and **8** preallocated
-2,848-byte Event Chunk accounts. A chunk contains up to **32** compact,
-append-only events, so the default preserves **256** important events.
-
-These are not VRF batches and they do not store movement, HP ticks, bullets,
-or frame-level gameplay. They preserve room resolutions, kills, respawns,
-portal transitions, extraction, and final state so clients/indexers can replay
-verifiable match history after ER commits to base Solana.
-
-The chunks are preallocated because the current program validates a fixed,
-bounded chunk-account set for event writes. That gives deterministic account
-metas during gameplay and lets the delegated-chunk mask prove that the world
-is complete before Match delegation. Eight is the default capacity, not an
-inherent MagicBlock requirement: a shorter configured match may use fewer
-chunks, while the v5 mask supports up to 16. Reducing the count lowers upfront
-rent but also lowers the maximum durable event history.
-
-For eight chunks, Match + chunks base rent is approximately **0.20200704 SOL**.
-Delegation records/metadata and transaction fees bring the current preflight
-estimate to approximately **0.230153280 SOL** before the 0.001 SOL safety
-reserve. This is configuration-dependent, not a fixed ER fee.
-
-## Explorer links
-
-- Labyrinth: [Devnet Explorer](https://explorer.solana.com/address/FbJpQqmiwrf9ZctR4sBQhKqgrUFqD8wfeD2VpZQukACH?cluster=devnet)
-- MagicBlock VRF: [`Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz`](https://explorer.solana.com/address/Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz?cluster=devnet)
-- MagicBlock Delegation: [`DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`](https://explorer.solana.com/address/DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh?cluster=devnet)
-
-## Historical v4 server-payer bootstrap
-
-The prior v4 integration used the backend signer as payer and transaction
-submitter. This historical flow is preserved for comparison and is not deleted
-or rewritten here. It is superseded for new launches because the server should
-not pay player world-account rent or submit bootstrap transactions.
-
-The v5 binary was deployed to Devnet in slot `482420384`. The Direct and
-Ranked player-paid smoke tests both succeeded before this document was updated.
+The deployed v6 ELF is byte-for-byte equal to the local artifact SHA-256:
+`e707e80fc16e1883954d472849fd043b4ed7ee6de199ba319b719a2107d0c8aa`.

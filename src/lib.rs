@@ -2,6 +2,7 @@
 
 use pinocchio::{AccountView, Address, ProgramResult};
 
+pub mod compact;
 pub mod error;
 pub mod events;
 pub mod instruction;
