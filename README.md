@@ -26,8 +26,8 @@ does not enter a gameplay room until the player-paid v6 bootstrap is confirmed:
 4. The Session Key then submits `initialize_match_v6` and
    `delegate_match_v6`; it is the payer/executor. The off-chain game server
    only signs the permit and verifies accounts read-only.
-5. The UI verifies the delegated ER Match, then opens the Colyseus gameplay
-   room and routes the player to `/game/ranked/labyrinth/:matchId`.
+5. The UI verifies the delegated ER Match, then opens the gameplay room and
+   routes the player to `/game/ranked/labyrinth/:matchId`.
 
 The expected setup labels are: **Checking setup funds → Creating Ranked Match
 → Initializing Labyrinth → Delegating Labyrinth → Verifying ER → Launching room
@@ -55,7 +55,7 @@ produce the same binary.
 | Version | Account model | Player/Server authority | Why it changed |
 | --- | --- | --- | --- |
 | v4 | 5,088-byte Match plus configured EventChunks | Backend signer initialized, delegated, and committed | Initial ER/world prototype. It violated the desired player-pays boundary and made the server pay rent. |
-| v5 | Same Match plus up to 16 EventChunks; default was 8 | Final player could initialize/delegate through a server-signed permit; Main-or-Session payer support | Removed Colyseus as transaction executor. It still required a large Match, chunk rent, and ten default bootstrap transactions. |
+| v5 | Same Match plus up to 16 EventChunks; default was 8 | Final player could initialize/delegate through a server-signed permit; Main-or-Session payer support | Removed the off-chain server as transaction executor. It still required a large Match, chunk rent, and ten default bootstrap transactions. |
 | v6 | One compact 512-byte Match; no EventChunks | Session Key signs bootstrap, gameplay requests, and terminal commit. Server signs permits/observes only. | Makes player-paid setup practical: compact roster proofs, deterministic room summaries, rolling event hash, two bootstrap transactions, and player-submitted commit/undelegate. |
 
 v6 supports both origins through the same compact instructions:
@@ -66,8 +66,8 @@ v6 supports both origins through the same compact instructions:
   MatchRecord reference.
 
 v6 intentionally trades v5's full event-payload archive for compact canonical
-state plus a rolling event hash and terminal hash. Colyseus still owns detailed
-movement/combat logs; the compact Labyrinth account anchors the verifiable
+state plus a rolling event hash and terminal hash. The off-chain gameplay
+service still owns detailed movement/combat logs; the compact Labyrinth account anchors the verifiable
 world/result facts without recording every frame-level event.
 
 ## v6 compact player-paid bootstrap

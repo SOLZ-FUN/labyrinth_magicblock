@@ -46,7 +46,7 @@ Checking setup funds
 
 If a wallet approval, rent payment, or transaction confirmation fails, the UI
 stays in **Labyrinth recovery** with the same Match ID. It never creates a
-Colyseus gameplay room or navigates to a match page before ER verification.
+gameplay room or navigates to a match page before ER verification.
 
 ## Authority
 
@@ -117,7 +117,7 @@ flowchart TD
     F --> G
     G --> H["Session Key pays rent and delegates Match to MagicBlock ER"]
     H --> I["Off-chain server verifies ER state read-only"]
-    I -->|"Verified"| J["Create Colyseus gameplay room"]
+    I -->|"Verified"| J["Create gameplay room"]
     J --> K["Navigate to /game/(ranked/)labyrinth/:matchId"]
     I -->|"Missing or invalid"| L["Labyrinth recovery: resume same Match ID"]
     L --> G
